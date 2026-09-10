@@ -1,0 +1,64 @@
+# Copy to config.yaml and edit. `migrate.py` reads config.yaml by default (-c to override).
+# ${VAR} anywhere in a value is expanded from the environment.
+
+source:
+  # The dense index that is serving production traffic today. Left untouched by
+  # every phase except `simulate-source`, which only runs against a throwaway index.
+  index: dense-migration-demo
+  namespace: __default__
+  # Metadata key on the source records that holds the text to search. If your
+  # export has no text in metadata, see "No source text?" in the README — it has
+  # to be joined in before `convert`.
+  text_metadata_key: text
+
+target:
+  index: fts-migration-demo
+  # Bulk import can only create namespaces that do not exist yet, so this must be
+  # absent from the target index when `import` runs.
+  namespace: __default__
+  dense_field: embedding
+  # Metadata keys promoted to full-text-search string fields, in order. The first
+  # one is what `parity` runs its BM25 checks against.
+  text_fields: [text]
+  full_text_search:
+    language: en
+    stemming: true
+    stop_words: true
+  deployment:
+    cloud: aws
+    region: us-east-1
+  read_capacity:
+    mode: OnDemand
+
+export:
+  dir: work/export
+  rows_per_file: 25000
+
+convert:
+  dir: work/jsonl
+  gzip: true
+  # Metadata keys to leave behind. Everything else rides along as filterable metadata.
+  drop_fields: []
+  # Rename metadata keys on the way in, e.g. {body: text}. Applied before text_fields
+  # is checked, so rename first and declare the new name in target.text_fields.
+  rename_fields: {}
+
+import:
+  # upsert: replay the JSONL through documents.upsert — no bucket needed, good for
+  #         demos and small indexes.
+  # import: the real bulk import from object storage. Needs uri + integration_id.
+  mode: upsert
+  uri: s3://your-bucket/fts-migration
+  integration_id: ${PINECONE_STORAGE_INTEGRATION_ID}
+  error_mode: continue
+
+cdc:
+  db: work/cdc.sqlite
+  batch_size: 500
+
+demo:
+  records: 2000
+  dimension: 384
+  # Writes per second the background workload applies to the source index while
+  # the export, convert and import phases run.
+  write_rate: 5

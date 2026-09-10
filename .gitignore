@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.pytest_cache/
+work/
+*.parquet
+*.jsonl
+*.jsonl.gz
+*.sqlite
+*.sqlite-journal
+config.yaml
+.ruff_cache/

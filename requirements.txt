@@ -1,0 +1,9 @@
+# dense -> full-text-search migration toolkit dependencies
+# Install into the project venv:  pip install -r requirements.txt
+pinecone>=10.0            # v10 is the first SDK with the documents API (index.documents.*)
+pyarrow>=15               # read/write Parquet in the index-export format
+numpy>=1.26               # synthetic vectors + parity math
+pyyaml>=6.0               # config.yaml
+tqdm>=4.66                # progress bars on long conversions and sweeps
+boto3>=1.34               # optional: upload the JSONL tree to Amazon S3
+pytest>=8.0                # tests only
