@@ -166,3 +166,57 @@ def test_shards_are_split_and_gzipped(tmp_path: Path):
     with gzip.open(out_dir / "0.jsonl.gz", "rt") as handle:
         assert len(handle.readlines()) == 4
     assert len(list(iter_jsonl_dir(out_dir))) == 10
+
+
+def test_reconvert_does_not_leave_stale_shards_behind(tmp_path: Path):
+    """A re-run after deletions produces fewer shards; the old ones must not survive
+    to reload documents the source no longer has."""
+    export_dir = tmp_path / "export"
+    out_dir = tmp_path / "jsonl"
+    settings = make_settings()
+
+    write_export(export_dir, [row(f"doc-{i}", {"text": "body"}) for i in range(10)])
+    parquet_to_jsonl(export_dir, out_dir, DocumentMapper(settings, dimension=3), rows_per_file=4)
+    assert len(list(iter_jsonl_dir(out_dir))) == 10
+
+    write_export(export_dir, [row(f"doc-{i}", {"text": "body"}) for i in range(3)])
+    parquet_to_jsonl(export_dir, out_dir, DocumentMapper(settings, dimension=3), rows_per_file=4)
+
+    remaining = [d["_id"] for d in iter_jsonl_dir(out_dir)]
+    assert remaining == ["doc-0", "doc-1", "doc-2"]
+
+
+def test_unset_env_var_is_blanked_and_reported_not_sent_verbatim(tmp_path: Path, monkeypatch):
+    """An unset ${VAR} must never reach the API as a literal, but it also must not stop
+    the phases that do not need it."""
+    import pytest as _pytest
+    import yaml as _yaml
+
+    from fts_migrate.config import ConfigError, load_settings
+
+    monkeypatch.delenv("SOME_UNSET_INTEGRATION_ID", raising=False)
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        _yaml.safe_dump(
+            {
+                "source": {"index": "src"},
+                "target": {"index": "dst", "dense_field": "embedding", "text_fields": ["text"]},
+                "import": {"integration_id": "${SOME_UNSET_INTEGRATION_ID}"},
+            }
+        )
+    )
+
+    settings = load_settings(path)
+
+    assert settings.import_.integration_id == ""
+    assert settings.unresolved_vars == ("SOME_UNSET_INTEGRATION_ID",)
+    with _pytest.raises(ConfigError, match="SOME_UNSET_INTEGRATION_ID"):
+        settings.require_env("SOME_UNSET_INTEGRATION_ID", "the import path needs it")
+
+
+def test_the_shipped_example_config_loads_with_no_env_vars_set(monkeypatch):
+    from fts_migrate.config import load_settings
+
+    monkeypatch.delenv("PINECONE_STORAGE_INTEGRATION_ID", raising=False)
+    settings = load_settings("config.example.yaml")
+    assert settings.import_.integration_id == ""

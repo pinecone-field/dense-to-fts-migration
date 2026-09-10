@@ -33,6 +33,10 @@ MAX_IDS_PER_DELETE = 1000
 MAX_UPSERT_BYTES = 2 * 1024 * 1024
 SQLITE_PARAM_CHUNK = 500
 
+UNCAPTURABLE_METHODS = frozenset(
+    {"upsert_from_dataframe", "upsert_records", "delete_namespace", "start_import"}
+)
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS changes (
   seq       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,6 +50,13 @@ CREATE INDEX IF NOT EXISTS changes_ns_id ON changes (namespace, doc_id);
 CREATE TABLE IF NOT EXISTS cursor (
   name TEXT PRIMARY KEY,
   seq  INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS unapplied (
+  seq       INTEGER PRIMARY KEY,
+  ts        REAL    NOT NULL,
+  namespace TEXT    NOT NULL,
+  doc_id    TEXT    NOT NULL,
+  reason    TEXT    NOT NULL
 );
 """
 
@@ -70,6 +81,7 @@ class Action:
 
     op: str
     doc_id: str
+    seq: int = 0
     record: dict[str, Any] | None = None
     values: list[float] | None = None
     set_metadata: dict[str, Any] | None = None
@@ -84,10 +96,16 @@ class ApplyStats:
     through_seq: int = 0
 
     def summary(self) -> str:
-        return (
+        line = (
             f"{self.upserted} upserted, {self.updated} patched, {self.deleted} deleted, "
-            f"{self.skipped} skipped, cursor at seq {self.through_seq}"
+            f"cursor at seq {self.through_seq}"
         )
+        if self.skipped:
+            line += (
+                f" | {self.skipped} PARKED as unapplied — those documents are stale on the "
+                f"target until the text is joined in (see `migrate.py status`)"
+            )
+        return line
 
 
 @dataclass(frozen=True)
@@ -191,6 +209,32 @@ class CdcLog:
         with self._lock:
             return self.conn.execute(sql, params).fetchall()
 
+    def record_unapplied(self, change_seq: int, namespace: str, doc_id: str, reason: str) -> None:
+        """Park a change replay could not apply.
+
+        The cursor still advances past it, so without this row the change would be
+        counted once and then be unreachable — the log has no way to re-drive it.
+        """
+        with self._lock:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO unapplied (seq, ts, namespace, doc_id, reason) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (change_seq, time.time(), namespace, doc_id, reason),
+            )
+
+    def unapplied(self, limit: int = 100) -> list[sqlite3.Row]:
+        return self._query(
+            "SELECT seq, ts, namespace, doc_id, reason FROM unapplied ORDER BY seq LIMIT ?",
+            (limit,),
+        )
+
+    def unapplied_count(self) -> int:
+        return int(self._query("SELECT COUNT(*) AS n FROM unapplied")[0]["n"])
+
+    def clear_unapplied(self, seqs: Sequence[int]) -> None:
+        with self._lock:
+            self.conn.executemany("DELETE FROM unapplied WHERE seq = ?", [(s,) for s in seqs])
+
     def head_seq(self) -> int:
         row = self._query("SELECT COALESCE(MAX(seq), 0) AS seq FROM changes")[0]
         return int(row["seq"])
@@ -290,11 +334,13 @@ class CdcLog:
         actions: list[Action] = []
         for change in latest:
             if change.op == DELETE:
-                actions.append(Action(op=DELETE, doc_id=change.doc_id))
+                actions.append(Action(op=DELETE, doc_id=change.doc_id, seq=change.seq))
             elif change.op == UPSERT:
-                actions.append(Action(op=UPSERT, doc_id=change.doc_id, record=change.record))
+                actions.append(
+                    Action(op=UPSERT, doc_id=change.doc_id, seq=change.seq, record=change.record)
+                )
             else:
-                actions.append(_fold(change.doc_id, history.get(change.doc_id, [])))
+                actions.append(_fold(change.doc_id, history.get(change.doc_id, []), change.seq))
         return actions
 
 
@@ -309,7 +355,7 @@ def _row_to_change(row: Any) -> Change:
     )
 
 
-def _fold(doc_id: str, changes: Sequence[Change]) -> Action:
+def _fold(doc_id: str, changes: Sequence[Change], seq: int) -> Action:
     record: dict[str, Any] | None = None
     values: list[float] | None = None
     set_metadata: dict[str, Any] = {}
@@ -332,8 +378,8 @@ def _fold(doc_id: str, changes: Sequence[Change]) -> Action:
                 set_metadata.update(payload.get("set_metadata") or {})
 
     if record is not None:
-        return Action(op=UPSERT, doc_id=doc_id, record=record)
-    return Action(op=UPDATE, doc_id=doc_id, values=values, set_metadata=set_metadata)
+        return Action(op=UPSERT, doc_id=doc_id, seq=seq, record=record)
+    return Action(op=UPDATE, doc_id=doc_id, seq=seq, values=values, set_metadata=set_metadata)
 
 
 class CdcWrappedIndex:
@@ -350,10 +396,24 @@ class CdcWrappedIndex:
         self._namespace = namespace
 
     def __getattr__(self, name: str) -> Any:
+        if name in UNCAPTURABLE_METHODS:
+            raise CdcError(
+                f"{name}() writes to the source index without going through the capture "
+                f"path, so those changes would be missing from the target at cutover. "
+                f"Use upsert()/update()/delete() on this wrapper for the duration of the "
+                f"migration."
+            )
         return getattr(self._index, name)
 
     def upsert(self, vectors: Sequence[Any], namespace: str | None = None, **kwargs: Any) -> Any:
         namespace = namespace or self._namespace
+        if "batch_size" in kwargs:
+            raise CdcError(
+                "batch_size splits one call into several requests, and a failure part-way "
+                "through commits the earlier batches to the source index while this call "
+                "raises before anything is logged. Batch in your own code instead, so each "
+                "call is one request that is either captured or not made."
+            )
         result = self._index.upsert(vectors=vectors, namespace=namespace, **kwargs)
         self._log.append_upserts(namespace, vectors)
         return result
@@ -377,6 +437,8 @@ class CdcWrappedIndex:
         result = self._index.update(
             id=id, values=values, set_metadata=set_metadata, namespace=namespace, **kwargs
         )
+        if kwargs.get("dry_run"):
+            return result
         self._log.append_update(namespace, id, values=values, set_metadata=set_metadata)
         return result
 
@@ -455,6 +517,13 @@ def apply_changes(
             doc = mapper.from_record(record["id"], record.get("values"), record.get("metadata"))
             if doc is None:
                 stats.skipped += 1
+                if not dry_run:
+                    log.record_unapplied(
+                        action.seq,
+                        source_namespace or namespace,
+                        action.doc_id,
+                        "no text for the full-text field",
+                    )
                 continue
             to_upsert.append(doc)
 

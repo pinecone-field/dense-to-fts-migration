@@ -154,12 +154,12 @@ def diff_fields(
         if record["metadata"].get(settings.source.text_metadata_key) != doc.get(text_field):
             report.text_mismatches.append(record_id)
 
-        for key, value in record["metadata"].items():
-            if key == settings.source.text_metadata_key:
+        for raw_key, value in record["metadata"].items():
+            if raw_key == settings.source.text_metadata_key:
                 continue
-            if key in settings.convert.drop_fields:
+            key = settings.convert.rename_fields.get(raw_key, raw_key)
+            if raw_key in settings.convert.drop_fields or key in settings.convert.drop_fields:
                 continue
-            key = settings.convert.rename_fields.get(key, key)
             if key in settings.target.text_fields:
                 continue
             if doc.get(key) != value:

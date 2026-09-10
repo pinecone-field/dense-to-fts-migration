@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import random
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
 
@@ -55,7 +55,24 @@ class CutoverState:
     def load(cls, path: Path) -> CutoverState:
         if not path.exists():
             return cls()
-        return cls(**json.loads(path.read_text()))
+        raw = json.loads(path.read_text())
+        known = {f.name for f in fields(cls)}
+        unknown = sorted(set(raw) - known)
+        if unknown:
+            raise ValueError(f"{path}: unrecognised cutover state field(s): {', '.join(unknown)}")
+        state = cls(**{k: v for k, v in raw.items() if k in known})
+        state.validate()
+        return state
+
+    def reload(self, path: Path) -> CutoverState:
+        """Re-read the state file so a running process picks up a ramp or a rollback.
+
+        A `SearchRouter` holds one state object for the life of the process, so without
+        this a `migrate.py cutover` command changes the file and nothing else.
+        """
+        fresh = CutoverState.load(path)
+        self.mode, self.target_read_pct, self.note = fresh.mode, fresh.target_read_pct, fresh.note
+        return self
 
     def save(self, path: Path) -> None:
         self.validate()
@@ -89,18 +106,27 @@ class SearchRouter:
         self._rng = random.Random(seed)
 
     def search(self, vector: Sequence[float], top_k: int = 10) -> list[str]:
-        if self.state.mode == DONE:
-            return self._target_search(vector, top_k)
-        if self.state.mode == RAMP and self._rng.uniform(0, 100) < self.state.target_read_pct:
+        """Serve a dense search from whichever index the cutover state selects.
+
+        `done` means every read goes to the target; `target_read_pct` only governs a
+        `ramp`. Rolling back is therefore a move back into `ramp`, which is what
+        setting a percentage does — see `migrate.py cutover`.
+        """
+        if self.state.mode == DONE or (
+            self.state.mode == RAMP and self._rng.uniform(0, 100) < self.state.target_read_pct
+        ):
+            self.stats.target_reads += 1
             return self._target_search(vector, top_k)
 
         served = self._source_search(vector, top_k)
+        self.stats.source_reads += 1
         if self.state.mode == SHADOW:
             self._compare(vector, top_k, served)
         return served
 
     def search_text(self, query: str, top_k: int = 10) -> list[str]:
         """Keyword search, which only the target index can answer."""
+        self.stats.target_reads += 1
         response = self.target.documents.search(
             namespace=self.settings.target.namespace,
             top_k=top_k,
@@ -108,14 +134,12 @@ class SearchRouter:
                 {"type": "text", "query": query, "fields": list(self.settings.target.text_fields)}
             ],
         )
-        self.stats.target_reads += 1
         return [match.id for match in response.matches]
 
     def _source_search(self, vector: Sequence[float], top_k: int) -> list[str]:
         hits = self.source.query(
             vector=list(vector), top_k=top_k, namespace=self.settings.source.namespace
         )
-        self.stats.source_reads += 1
         return [match["id"] for match in hits["matches"]]
 
     def _target_search(self, vector: Sequence[float], top_k: int) -> list[str]:
@@ -130,10 +154,15 @@ class SearchRouter:
                 }
             ],
         )
-        self.stats.target_reads += 1
         return [match.id for match in response.matches]
 
     def _compare(self, vector: Sequence[float], top_k: int, served: list[str]) -> None:
+        """Query the target for comparison only.
+
+        Deliberately not counted as a target read: the read split is what tells an
+        operator how far the cutover has actually gone, and a shadow query served
+        nobody.
+        """
         shadow = self._target_search(vector, top_k)
         self.stats.shadow_comparisons += 1
         if set(shadow) != set(served):

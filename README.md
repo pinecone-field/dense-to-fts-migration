@@ -162,9 +162,13 @@ Two constraints worth knowing:
 
 - **A log append failure raises.** A silently dropped change is the one failure this migration
   cannot survive, so it is loud by design.
-- **`delete_all` and filtered deletes are refused** while the wrapper is in place: neither can
-  be replayed as a set of ids. Resolve the filter to ids first (`index.list` or `index.query`),
-  then delete by id.
+- **Writes it cannot capture are refused, not forwarded.** `delete_all` and filtered
+  deletes/updates cannot be replayed as a set of ids; `upsert_from_dataframe`,
+  `upsert_records` and `delete_namespace` bypass the capture path entirely; and `batch_size`
+  on an upsert splits one call into several requests, so a failure part-way through commits
+  some of them to the source while nothing is logged. All of these raise, because a write
+  that reaches the source and not the log is missing from the target at cutover. Resolve
+  filters to ids and batch in your own code.
 
 If you use a queue, Kafka topic, or outbox table already, point it at `CdcLog.append_upserts`
 and `CdcLog.append_deletes` instead of wrapping the index — the rest of the flow is unchanged.
@@ -321,6 +325,12 @@ are refused by the wrapper for the same reason filtered deletes are.
 `tail` reports lag as both a pending-change count and how far behind the oldest unapplied
 change is. Leave it running through reconciliation and the whole read ramp.
 
+**A change replay cannot apply is parked, not dropped.** The only such case is a captured
+record with no text for a full-text field. The cursor still has to move past it, so it is
+written to an `unapplied` table instead of being counted and forgotten — `migrate.py status`
+lists them, and `reconcile` refuses to look clean while any are outstanding. Those documents
+are stale on the target until you join the text in and reload them.
+
 ---
 
 ## Step 8 — Prove the two indexes agree
@@ -381,7 +391,10 @@ alongside for comparison only, so a mismatch shows up in the diff counter withou
 reaching a user.
 
 **Rollback is `python migrate.py cutover --pct 0`.** Nothing else — dual-write is still on, so
-the dense index has never fallen behind.
+the dense index has never fallen behind. Setting a percentage moves the state back into `ramp`
+if it had reached `done`, so the same command rolls back from anywhere; a long-running reader
+picks the change up with `CutoverState.reload(path)`, which is what makes it take effect
+without a redeploy.
 
 ### Decommissioning
 
@@ -440,7 +453,7 @@ pytest
 |---|---|
 | Everything except bulk import, end to end against live Pinecone | Verified. `migrate.py demo` on a real project: 2,050 records both sides, 88 writes captured and replayed during the load, id diff empty, field diff empty, dense recall 1.000, BM25 returning ranked hits. |
 | `--mode import` (bulk import from object storage) | **Not yet run against the service.** The JSONL, directory layout, `start_import` call and polling follow the documented contract, but nobody has watched a real import of these files finish. Run it once against your own bucket before relying on it, and please file an issue if the service disagrees with what this repo produces. |
-| Unit tests (`pytest`) | 33 tests, no API key needed: conversion and its limits, the missing-text paths, CDC folding and idempotency, cross-thread capture, reconcile diffing, router routing. |
+| Unit tests (`pytest`) | 44 tests, no API key needed: conversion and its limits, the missing-text paths, stale-shard clearing, CDC folding and idempotency, cross-thread capture, the wrapper's refusals, parked changes, reconcile diffing, and router routing including rollback from `done`. |
 
 ---
 

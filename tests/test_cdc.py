@@ -274,3 +274,53 @@ def test_concurrent_writers_all_land(log: CdcLog):
 
     assert not errors, errors
     assert log.head_seq() == 80
+
+
+def test_uncapturable_write_methods_raise_instead_of_passing_through(log: CdcLog):
+    class RichIndex(FakeVectorIndex):
+        def upsert_from_dataframe(self, *a, **kw):
+            self.records["leaked"] = {"id": "leaked"}
+
+        def upsert_records(self, *a, **kw):
+            self.records["leaked"] = {"id": "leaked"}
+
+        def delete_namespace(self, *a, **kw):
+            self.records.clear()
+
+    index = RichIndex()
+    wrapped = CdcWrappedIndex(index, log)
+    for method in ("upsert_from_dataframe", "upsert_records", "delete_namespace"):
+        with pytest.raises(CdcError, match="without going through the capture path"):
+            getattr(wrapped, method)()
+    assert index.records == {}
+
+
+def test_batch_size_is_refused_because_a_partial_failure_would_not_be_logged(log: CdcLog):
+    wrapped = CdcWrappedIndex(FakeVectorIndex(), log)
+    with pytest.raises(CdcError, match="batch_size"):
+        wrapped.upsert(vectors=[record("a")], batch_size=200)
+
+
+def test_dry_run_updates_are_not_logged(log: CdcLog):
+    wrapped = CdcWrappedIndex(FakeVectorIndex(), log)
+    wrapped.update(id="a", set_metadata={"text": "x"}, dry_run=True)
+    assert log.head_seq() == 0
+
+
+def test_unappliable_changes_are_parked_rather_than_forgotten(log: CdcLog):
+    """The cursor advances past them, so without the parking table they'd be lost."""
+    target = FakeTargetIndex()
+    settings = make_settings()
+    mapper = DocumentMapper(settings, dimension=3, allow_missing_text=True)
+    log.append_upserts("__default__", [{"id": "a", "values": [0.1, 0.2, 0.3], "metadata": {}}])
+
+    stats = apply_changes(target, log, mapper, namespace="__default__")
+
+    assert stats.skipped == 1
+    assert "a" not in target.documents.docs
+    parked = log.unapplied()
+    assert [(r["doc_id"], r["reason"]) for r in parked] == [
+        ("a", "no text for the full-text field")
+    ]
+    assert log.unapplied_count() == 1
+    assert "PARKED" in stats.summary()

@@ -13,6 +13,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
 from pinecone import Pinecone, SchemaBuilder
+from pinecone.errors import NotFoundError
 
 from .config import Settings
 from .dense_source import SourceSpec
@@ -81,10 +82,15 @@ def open_index(pc: Pinecone, settings: Settings) -> Any:
 
 
 def namespace_exists(index: Any, namespace: str) -> bool:
+    """Only a not-found answer means absent.
+
+    Treating any failure as "absent" would let a transient 500 wave through the
+    pre-import guard on a namespace that is actually populated.
+    """
     try:
         index.describe_namespace(name=namespace)
         return True
-    except Exception:
+    except NotFoundError:
         return False
 
 
@@ -101,7 +107,7 @@ def assert_namespace_absent(index: Any, namespace: str) -> None:
 def record_count(index: Any, namespace: str) -> int:
     try:
         description = index.describe_namespace(name=namespace)
-    except Exception:
+    except NotFoundError:
         return 0
     count = getattr(description, "record_count", None)
     if count is None and isinstance(description, Mapping):

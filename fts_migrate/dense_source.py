@@ -67,13 +67,26 @@ def _field(record: Any, name: str) -> Any:
     return getattr(record, name, None)
 
 
+DEFAULT_NAMESPACE_KEYS = ("__default__", "")
+
+
 def record_count(index: Any, namespace: str) -> int:
+    """Count records in a namespace.
+
+    describe_index_stats has spelled the default namespace both ways — the SDK
+    documents it as the empty string, the API docs as "__default__" — so try both
+    rather than silently report zero.
+    """
     stats = index.describe_index_stats()
     namespaces = _field(stats, "namespaces") or {}
-    entry = namespaces.get(namespace)
-    if entry is None:
-        return 0
-    return int(_field(entry, "vector_count") or 0)
+    candidates = (
+        DEFAULT_NAMESPACE_KEYS if namespace in DEFAULT_NAMESPACE_KEYS else (namespace,)
+    )
+    for key in candidates:
+        entry = namespaces.get(key)
+        if entry is not None:
+            return int(_field(entry, "vector_count") or 0)
+    return 0
 
 
 def iter_ids(index: Any, namespace: str, limit: int | None = None) -> Iterator[str]:

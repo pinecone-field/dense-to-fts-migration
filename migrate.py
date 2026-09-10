@@ -189,6 +189,13 @@ def cmd_import(ctx: Context, args: argparse.Namespace) -> int:
         loaded = importer.upsert_from_jsonl(target, settings.target.namespace, jsonl_dir)
         say(f"upserted {loaded} documents into {settings.target.index}/{settings.target.namespace}")
     else:
+        settings.require_env(
+            "PINECONE_STORAGE_INTEGRATION_ID",
+            "bulk import from a private bucket needs a storage integration id",
+        )
+        if not settings.import_.uri:
+            say("import.uri is not set in the config — nowhere to upload to or import from")
+            return 1
         target_index.assert_namespace_absent(target, settings.target.namespace)
         if not args.skip_upload:
             prefix = importer.upload_tree(
@@ -277,6 +284,12 @@ def cmd_reconcile(ctx: Context, args: argparse.Namespace) -> int:
 
     with ctx.log() as log:
         lag = log.lag(CURSOR_NAME)
+        parked = log.unapplied_count()
+    if parked:
+        say(
+            f"NOTE: {parked} change(s) were parked as unapplied and are NOT reflected below. "
+            f"Run `migrate.py status` to see them."
+        )
     if lag.pending:
         say(
             f"NOTE: {lag.pending} CDC changes are unapplied ({lag.seconds:.0f}s behind). "
@@ -320,14 +333,25 @@ def cmd_cutover(ctx: Context, args: argparse.Namespace) -> int:
         state.mode = args.mode
     if args.pct is not None:
         state.target_read_pct = args.pct
+        if not args.mode and state.mode != cutover_mod.RAMP:
+            say(f"moving from {state.mode} to ramp, since a percentage only governs a ramp")
+            state.mode = cutover_mod.RAMP
     if args.note:
         state.note = args.note
     state.save(CUTOVER_STATE_PATH)
     say(f"cutover state: mode={state.mode} target_read_pct={state.target_read_pct}")
-    if state.mode == cutover_mod.RAMP and state.target_read_pct < 100:
-        say("rollback is `python migrate.py cutover --pct 0` — dual-write is still on")
+
+    if state.mode == cutover_mod.SHADOW:
+        say("the source serves every read; the target is queried alongside for comparison")
+    if state.mode == cutover_mod.RAMP:
+        say(
+            f"{state.target_read_pct}% of reads go to the target. Roll back with "
+            f"`python migrate.py cutover --pct 0` — dual-write is still on."
+        )
     if state.mode == cutover_mod.DONE:
         say("all reads on the target index. Keep dual-write until you delete the source index.")
+        say("roll back with `python migrate.py cutover --pct 0`, which returns you to a ramp.")
+    say("a long-running reader picks this up via CutoverState.reload(path).")
     return 0
 
 
@@ -342,6 +366,12 @@ def cmd_status(ctx: Context, args: argparse.Namespace) -> int:
     if settings.cdc.db.exists():
         with ctx.log() as log:
             say(f"cdc:    {log.lag(CURSOR_NAME)}")
+            parked = log.unapplied_count()
+            if parked:
+                say(f"unapplied: {parked} change(s) replay could not apply:")
+                for row in log.unapplied(limit=10):
+                    say(f"  seq {row['seq']}  {row['doc_id']}  {row['reason']}")
+                say("  those documents are stale on the target until you reload them")
     else:
         say(f"cdc:    {settings.cdc.db} (not created)")
     state = cutover_mod.CutoverState.load(CUTOVER_STATE_PATH)

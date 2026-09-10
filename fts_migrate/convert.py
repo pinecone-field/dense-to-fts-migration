@@ -242,11 +242,19 @@ def parquet_to_jsonl(
     `parquet_dir` is one namespace's export directory; `out_dir` is the matching
     namespace subdirectory under the import prefix. The dense dimension is taken from
     the first row and enforced across the rest, so this step needs no API access.
+
+    Existing JSONL in `out_dir` is deleted first: a re-run after deletions produces
+    fewer shards, and leaving the old ones behind would reload documents the source
+    no longer has.
     """
     stats = MappingStats()
     files = sorted(parquet_dir.glob("*.parquet"))
     if not files:
         raise ConversionError(f"no .parquet files found in {parquet_dir}")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for stale in [*out_dir.glob("*.jsonl"), *out_dir.glob("*.jsonl.gz")]:
+        stale.unlink()
 
     shard = 0
     rows_in_shard = 0

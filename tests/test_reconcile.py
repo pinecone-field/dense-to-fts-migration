@@ -155,3 +155,74 @@ def test_router_done_never_reads_the_source():
 
     assert router.stats.source_reads == 0
     assert router.stats.target_reads == 1
+
+
+def test_rollback_from_done_returns_reads_to_the_source():
+    """The documented rollback has to work from `done`, not only mid-ramp."""
+    settings = make_settings()
+    source = FakeSourceIndex({"a": source_record("a")})
+    target = FakeTargetIndex({"a": target_doc("a")})
+    router = SearchRouter(source, target, settings, CutoverState(mode=DONE))
+
+    router.search([0.1, 0.2, 0.3])
+    assert router.stats.target_reads == 1
+
+    router.state.mode, router.state.target_read_pct = RAMP, 0.0
+    router.search([0.1, 0.2, 0.3])
+    assert router.stats.source_reads == 1
+
+
+def test_shadow_comparisons_are_not_counted_as_target_reads():
+    settings = make_settings()
+    source = FakeSourceIndex({"a": source_record("a")})
+    target = FakeTargetIndex({"a": target_doc("a")})
+    router = SearchRouter(source, target, settings, CutoverState(mode=SHADOW))
+
+    router.search([0.1, 0.2, 0.3])
+
+    assert router.stats.source_reads == 1
+    assert router.stats.target_reads == 0
+    assert router.stats.shadow_comparisons == 1
+
+
+def test_cutover_state_rejects_unknown_and_invalid_fields(tmp_path):
+    import json as _json
+
+    import pytest as _pytest
+
+    path = tmp_path / "cutover.json"
+    path.write_text(_json.dumps({"mode": "ramp", "target_read_pct": 10.0, "future_field": 1}))
+    with _pytest.raises(ValueError, match="unrecognised"):
+        CutoverState.load(path)
+
+    path.write_text(_json.dumps({"mode": "ramp", "target_read_pct": 500.0}))
+    with _pytest.raises(ValueError, match="between 0 and 100"):
+        CutoverState.load(path)
+
+
+def test_state_reload_picks_up_a_rollback(tmp_path):
+    path = tmp_path / "cutover.json"
+    CutoverState(mode=DONE, target_read_pct=100.0).save(path)
+    state = CutoverState.load(path)
+
+    CutoverState(mode=RAMP, target_read_pct=0.0).save(path)
+    state.reload(path)
+
+    assert (state.mode, state.target_read_pct) == (RAMP, 0.0)
+
+
+def test_drop_fields_are_matched_after_rename_too():
+    """convert drops on either spelling; reconcile must agree or it invents mismatches."""
+    from fts_migrate.config import ConvertSettings
+
+    settings = make_settings(
+        convert=ConvertSettings(rename_fields={"body": "text_body"}, drop_fields=["text_body"])
+    )
+    source = FakeSourceIndex(
+        {"a": {"id": "a", "values": [0.1, 0.2, 0.3], "metadata": {"body": "x"}}}
+    )
+    target = FakeTargetIndex({"a": {"_id": "a", "embedding": [0.1, 0.2, 0.3], "text": None}})
+
+    report = reconcile.diff_fields(source, target, settings, ["a"])
+
+    assert report.metadata_mismatches == []

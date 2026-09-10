@@ -7,6 +7,7 @@ and `sync.py` all agree on which indexes, namespaces and directories are in play
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -20,13 +21,26 @@ class ConfigError(RuntimeError):
     """Raised when the config file is missing, malformed, or internally inconsistent."""
 
 
-def _expand(value: Any) -> Any:
+UNRESOLVED_VAR = re.compile(r"\$\{([^}]+)\}")
+
+
+def _expand(value: Any, unresolved: set[str]) -> Any:
+    """Substitute ${VAR} references, blanking the ones with nothing to substitute.
+
+    Blanking rather than raising keeps a config usable when it names a variable only
+    one phase needs — the example config references a storage-integration id that the
+    upsert path never touches. The names are collected so the phase that does need
+    one can say which is missing.
+    """
     if isinstance(value, str):
-        return os.path.expandvars(value)
+        expanded = os.path.expandvars(value)
+        for match in UNRESOLVED_VAR.finditer(expanded):
+            unresolved.add(match.group(1))
+        return UNRESOLVED_VAR.sub("", expanded)
     if isinstance(value, dict):
-        return {k: _expand(v) for k, v in value.items()}
+        return {k: _expand(v, unresolved) for k, v in value.items()}
     if isinstance(value, list):
-        return [_expand(v) for v in value]
+        return [_expand(v, unresolved) for v in value]
     return value
 
 
@@ -97,6 +111,15 @@ class Settings:
     cdc: CdcSettings
     demo: DemoSettings
     path: Path
+    unresolved_vars: tuple[str, ...] = ()
+
+    def require_env(self, name: str, why: str) -> None:
+        """Fail with the variable's name when a phase needs one that was never set."""
+        if name in self.unresolved_vars:
+            raise ConfigError(
+                f"{self.path} references ${{{name}}}, which is not set — {why}. Export it "
+                f"and retry (e.g. `set -a; source .env; set +a`)."
+            )
 
     @property
     def api_key(self) -> str:
@@ -116,7 +139,8 @@ def load_settings(path: str | Path | None = None) -> Settings:
         raise ConfigError(
             f"{config_path} not found. Copy config.example.yaml to {config_path} and edit it."
         )
-    raw = _expand(yaml.safe_load(config_path.read_text()) or {})
+    unresolved: set[str] = set()
+    raw = _expand(yaml.safe_load(config_path.read_text()) or {}, unresolved)
 
     try:
         source = SourceSettings(**raw["source"])
@@ -151,4 +175,5 @@ def load_settings(path: str | Path | None = None) -> Settings:
         cdc=CdcSettings(**cdc_raw),
         demo=DemoSettings(**(raw.get("demo") or {})),
         path=config_path,
+        unresolved_vars=tuple(sorted(unresolved)),
     )
