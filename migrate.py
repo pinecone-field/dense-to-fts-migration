@@ -214,14 +214,22 @@ def cmd_import(ctx: Context, args: argparse.Namespace) -> int:
         if not args.wait:
             say(f"track it with: python migrate.py import-status {import_id}")
             return 0
-        state = importer.wait_for_import(
-            target,
-            import_id,
-            on_poll=lambda s: say(
-                f"  {s.get('status')} {s.get('percent_complete')}% "
-                f"({s.get('records_imported')} records)"
-            ),
-        )
+        seen: set[tuple[Any, Any]] = set()
+
+        def report(state: dict[str, Any]) -> None:
+            """Print only when the import's status or progress actually moves.
+
+            An import runs for ten minutes or more at a 20-second poll, so echoing
+            every poll buries the one line that changes."""
+            key = (state.get("status"), state.get("percent_complete"))
+            if key not in seen:
+                seen.add(key)
+                say(
+                    f"  {state.get('status')} {state.get('percent_complete')}% "
+                    f"({state.get('records_imported')} records)"
+                )
+
+        state = importer.wait_for_import(target, import_id, on_poll=report)
         say(f"import {import_id} completed: {state.get('records_imported')} records")
 
     sample_ids = [doc["_id"] for _, doc in zip(range(100), iter_jsonl_dir(jsonl_dir))]

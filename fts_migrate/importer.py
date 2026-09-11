@@ -76,7 +76,14 @@ def upload_tree(local_dir: Path, uri: str, namespace: str) -> str:
             f"{uri.rstrip('/')}/{namespace}/ with your provider's CLI "
             f"(gcloud storage cp / az storage blob upload-batch), then rerun with --skip-upload."
         )
-    import boto3
+    try:
+        import boto3
+    except ImportError as exc:
+        raise BulkImportError(
+            "uploading to S3 needs boto3, which is not installed. Run "
+            "`pip install -r requirements.txt`, or upload the files yourself and rerun "
+            "with --skip-upload."
+        ) from exc
 
     client = boto3.client("s3")
     destination = f"{prefix.rstrip('/')}/{namespace}" if prefix else namespace

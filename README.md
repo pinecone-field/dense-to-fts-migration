@@ -311,7 +311,13 @@ python migrate.py import --mode import
 It uploads `work/jsonl/<namespace>/` to `<uri>/<namespace>/`, calls `start_import` against the
 whole dataset prefix, and polls until the import finishes. You need a
 [storage integration](https://docs.pinecone.io/guides/operations/integrations/manage-storage-integrations)
-unless the bucket is public. Set `import.uri` and `import.integration_id` in `config.yaml`.
+unless the bucket is public. Set `import.uri` and `import.integration_id` in `config.yaml`. If you
+don't know your integration's id, list them with:
+
+```bash
+curl -sS https://api.pinecone.io/storage-integrations \
+  -H "Api-Key: $PINECONE_API_KEY" -H "X-Pinecone-Api-Version: unstable"
+```
 Automatic upload is implemented for S3; for GCS or Azure, copy the tree up with your provider's
 CLI and pass `--skip-upload`.
 
@@ -527,7 +533,7 @@ has quietly lost semantic parity.
 | Path                                                            | Status                                                                                                                                                                                                                                                                                                                                  |
 | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Everything except bulk import, end to end against live Pinecone | Verified. `migrate.py demo` on a real project: 2,395 records both sides, 768 writes captured and replayed during the load, id diff empty, field diff empty, dense recall 1.000, BM25 returning ranked hits.                                                                                                                              |
-| `--mode import` (bulk import from object storage)               | **Not yet run against the service.** The JSONL, directory layout, `start_import` call and polling follow the documented contract, but nobody has watched a real import of these files finish. Run it once against your own bucket before relying on it, and please file an issue if the service disagrees with what this repo produces. |
+| `--mode import` (bulk import from object storage) | Verified against the service. 600 documents uploaded to S3 and imported through a storage integration: the import reported `Completed 100.0%` with 600 records, matching what `convert` produced, and the imported index reconciled exactly against the source (0 missing, 0 orphaned, 0 field mismatches) with dense recall 1.000 and working BM25 ranking. |
 | Unit tests (`pytest`)                                           | 50 tests, no API key needed: conversion and its limits, the missing-text paths, stale-shard clearing, CDC folding and idempotency, cross-thread capture, the wrapper's refusals, parked changes, reconcile diffing, router routing including rollback from `done`, retry classification, batching, and per-field analyzer options.                                            |
 
 
