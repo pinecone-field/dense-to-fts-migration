@@ -77,21 +77,44 @@ class FieldReport:
         )
 
 
+DEFAULT_MIN_RECALL = 0.99
+
+
 @dataclass
 class ParityReport:
     queries: int
     top_k: int
     recall: float
     jaccard: float
+    absent_ids: list[str] = field(default_factory=list)
+    min_recall: float = DEFAULT_MIN_RECALL
 
     @property
     def ok(self) -> bool:
-        return self.recall >= 0.99
+        """Pass unless documents are genuinely missing.
+
+        Two indexes holding identical vectors still rank approximately, so a hit can
+        fall either side of the top_k boundary and drag recall below the threshold
+        while every document is present. Only a document the target cannot return at
+        all is a migration failure.
+        """
+        return self.recall >= self.min_recall or not self.absent_ids
 
     def render(self) -> str:
-        return (
+        line = (
             f"dense parity ({self.queries} queries, top_k={self.top_k}): "
             f"recall={self.recall:.3f} jaccard={self.jaccard:.3f}"
+        )
+        if self.recall >= self.min_recall:
+            return line
+        if self.absent_ids:
+            return (
+                f"{line}\n  {len(self.absent_ids)} document(s) in the source's results are "
+                f"missing from the target: {', '.join(self.absent_ids[:MAX_REPORTED_IDS])}"
+            )
+        return (
+            f"{line}\n  every document the source ranked is present on the target, so the "
+            f"shortfall is ranking order at the top_k boundary rather than missing data"
         )
 
 
@@ -176,6 +199,7 @@ def query_parity(
     queries: int = 20,
     top_k: int = 10,
     seed: int = 3,
+    min_recall: float = DEFAULT_MIN_RECALL,
 ) -> ParityReport:
     """Run the same dense queries against both indexes and compare the result sets.
 
@@ -195,6 +219,7 @@ def query_parity(
 
     recalls: list[float] = []
     jaccards: list[float] = []
+    shortfall: set[str] = set()
     for record in probes.values():
         vector = record["values"]
         source_hits = source.query(
@@ -218,14 +243,24 @@ def query_parity(
         if not source_ids:
             continue
         overlap = len(source_ids & target_ids)
+        shortfall |= source_ids - target_ids
         recalls.append(overlap / len(source_ids))
         jaccards.append(overlap / len(source_ids | target_ids))
+
+    absent: list[str] = []
+    if shortfall:
+        found = target_index.fetch_documents(
+            target, settings.target.namespace, sorted(shortfall), include_fields=["_id"]
+        )
+        absent = sorted(shortfall - set(found))
 
     return ParityReport(
         queries=len(recalls),
         top_k=top_k,
         recall=float(np.mean(recalls)) if recalls else 0.0,
         jaccard=float(np.mean(jaccards)) if jaccards else 0.0,
+        absent_ids=absent,
+        min_recall=min_recall,
     )
 
 

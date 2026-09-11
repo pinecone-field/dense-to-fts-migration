@@ -21,14 +21,33 @@ A document schema is fixed at index creation, and an existing dense index cannot
 
 1. Install, configure, and point the toolkit at your index.
 2. Choose the target schema — the one decision you cannot change later.
-3. **Turn on change capture, before anything else.**
+3. **Turn on change capture, before anything else** — unless nothing is writing (see below).
 4. Export the dense index to Parquet.
 5. Convert the Parquet to JSONL, the format document-schema imports take.
 6. Create the target index.
 7. Bulk import the JSONL (or upsert it, for smaller datasets).
-8. Replay the writes that landed during the load, then stay caught up.
+8. Replay the writes that landed during the load, then stay caught up (same exception).
 9. Reconcile the two indexes and check query parity.
 10. Ramp reads over, with a rollback that is one command.
+
+### Is your index taking writes?
+
+Steps 3 and 8 — capture and replay — exist for one reason: a bulk import takes at least ten minutes, and anything written to your dense index between the export snapshot and the end of the load would otherwise be lost. If nothing is writing during that window, you don't need them.
+
+**Skip capture and replay when your index is quiesced**: a static or batch-rebuilt corpus, a maintenance window you control, or a dry run to evaluate the target index before committing. Don't wrap your index, and the toolkit does the rest on its own — the log stays empty, and `replay` and `tail` have nothing to do:
+
+```bash
+python migrate.py export
+python migrate.py convert
+python migrate.py create-target
+python migrate.py import
+python sync.py reconcile          # still do this
+python migrate.py parity          # and this
+```
+
+**Keep reconcile and parity either way.** They are not there to catch missed writes; they are there to prove the load landed correctly, which is a risk whether or not anything is writing. `error_mode: continue` skips invalid documents and imports the rest, `--allow-missing-text` and `--lenient` skip rows by design, a namespace directory with no files is silently skipped, and a wrong `rename_fields` will map a field to the wrong place. None of that shows up in a record count. With a quiesced source the checks get sharper, not weaker: the id diff should be exactly zero, with no replay lag to explain away.
+
+The one thing you give up is the safety net. With no captured log, drift cannot be repaired after the fact — so verify before you move traffic, not after.
 
 ---
 
@@ -167,6 +186,9 @@ You can run this now to see the schema, or leave it until step 5.
 
 
 ## Step 2 — Turn on change capture, **before** you export
+
+> Skip this step, and step 7, if nothing is writing to your index during the migration. See
+> [Is your index taking writes?](#is-your-index-taking-writes) above.
 
 Your index is still taking writes. Bulk import can only create namespaces that do not yet
 exist, so nothing can be written into the target namespace until the import finishes — which
@@ -351,6 +373,9 @@ Either way, the load ends with a **freshness probe**. Documents are indexed asyn
 
 
 ## Step 7 — Keeping the indexes in sync
+
+> Nothing to do here if you skipped capture in step 2 — an empty log makes `replay` and `tail`
+> no-ops. Go straight to step 8, which still matters.
 
 ```bash
 python sync.py replay        # drain everything captured since capture started
@@ -541,7 +566,7 @@ has quietly lost semantic parity.
 | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Everything except bulk import, end to end against live Pinecone | Verified. `migrate.py demo` on a real project: 2,395 records both sides, 768 writes captured and replayed during the load, id diff empty, field diff empty, dense recall 1.000, BM25 returning ranked hits.                                                                                                                              |
 | `--mode import` (bulk import from object storage) | Verified against the service. 600 documents uploaded to S3 and imported through a storage integration: the import reported `Completed 100.0%` with 600 records, matching what `convert` produced, and the imported index reconciled exactly against the source (0 missing, 0 orphaned, 0 field mismatches) with dense recall 1.000 and working BM25 ranking. |
-| Unit tests (`pytest`)                                           | 50 tests, no API key needed: conversion and its limits, the missing-text paths, stale-shard clearing, CDC folding and idempotency, cross-thread capture, the wrapper's refusals, parked changes, reconcile diffing, router routing including rollback from `done`, retry classification, batching, and per-field analyzer options.                                            |
+| Unit tests (`pytest`)                                           | 52 tests, no API key needed: conversion and its limits, the missing-text paths, stale-shard clearing, CDC folding and idempotency, cross-thread capture, the wrapper's refusals, parked changes, reconcile diffing, router routing including rollback from `done`, retry classification, batching, and per-field analyzer options.                                            |
 
 
 ---
@@ -557,6 +582,7 @@ has quietly lost semantic parity.
 | Conversion stops with `no text for full-text field`                                       | The export has no searchable text. Join it in from your system of record — see "No source text?" above.                          |
 | `records_imported` is lower than the rows converted                                       | With `error_mode: continue`, invalid documents are skipped. Describe the import to see the file, row and `_id` of each error.    |
 | Search returns nothing right after a load                                                 | Documents index asynchronously. Wait for the freshness probe, and check `status.ready` (plus read-capacity state, on dedicated). |
+| `parity` recall is below 1.0 right after a load | Indexing is still settling; re-run it. A shortfall where every document is still fetchable is ranking order at the `top_k` boundary rather than missing data, and `parity` tells you which of the two it is. |
 | Reconcile reports missing ids on a live index                                             | Check the CDC lag first. Replay, wait for freshness, then re-check.                                                              |
 | `delete_all`/filtered delete raises from the wrapper                                      | Neither can be replayed as ids. Resolve to ids first, then delete by id.                                                         |
 | Import fails on an S3 bucket                                                              | The bucket must be on the same cloud as the index; S3 Express One Zone is not supported.                                         |

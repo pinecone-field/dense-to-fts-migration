@@ -226,3 +226,46 @@ def test_drop_fields_are_matched_after_rename_too():
     report = reconcile.diff_fields(source, target, settings, ["a"])
 
     assert report.metadata_mismatches == []
+
+
+class PartialDocuments(FakeDocuments):
+    """A target whose search drops one id from the top-k but still holds the document."""
+
+    def __init__(self, docs, drop: str) -> None:
+        super().__init__(docs)
+        self.drop = drop
+
+    def search(self, *, namespace, top_k, score_by, **kwargs):
+        ids = [i for i in self.docs if i != self.drop][:top_k]
+        return FakeSearchResponse(ids)
+
+
+def test_parity_passes_when_the_shortfall_is_ranking_order():
+    """Identical vectors still rank approximately, so a hit can fall either side of the
+    top_k boundary while every document is present."""
+    settings = make_settings()
+    records = {f"doc-{i}": source_record(f"doc-{i}") for i in range(6)}
+    source = FakeSourceIndex(records)
+    target = FakeTargetIndex({k: target_doc(k) for k in records})
+    target.documents = PartialDocuments(target.docs, drop="doc-0")
+
+    parity = reconcile.query_parity(source, target, settings, queries=3, top_k=6)
+
+    assert parity.recall < 1.0
+    assert parity.absent_ids == []
+    assert parity.ok
+    assert "ranking order" in parity.render()
+
+
+def test_parity_fails_when_a_document_is_genuinely_missing():
+    settings = make_settings()
+    records = {f"doc-{i}": source_record(f"doc-{i}") for i in range(6)}
+    source = FakeSourceIndex(records)
+    present = {k: target_doc(k) for k in records if k != "doc-0"}
+    target = FakeTargetIndex(present)
+
+    parity = reconcile.query_parity(source, target, settings, queries=3, top_k=6)
+
+    assert parity.absent_ids == ["doc-0"]
+    assert not parity.ok
+    assert "missing from the target" in parity.render()

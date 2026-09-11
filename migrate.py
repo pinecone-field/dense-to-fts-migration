@@ -246,10 +246,15 @@ def cmd_import(ctx: Context, args: argparse.Namespace) -> int:
         say(f"import {import_id} completed: {state.get('records_imported')} records")
 
     sample_ids = [doc["_id"] for _, doc in zip(range(100), iter_jsonl_dir(jsonl_dir))]
-    if importer.wait_until_searchable(target, settings.target.namespace, sample_ids):
-        say("loaded documents are fetchable — safe to replay the CDC backlog")
+    fetchable = importer.wait_until_searchable(target, settings.target.namespace, sample_ids)
+    with ctx.log() as log:
+        backlog = log.lag(CURSOR_NAME).pending
+    if not fetchable:
+        say("WARNING: sampled documents are not fetchable yet. Wait before going further.")
+    elif backlog:
+        say(f"loaded documents are fetchable — safe to replay the {backlog} captured changes")
     else:
-        say("WARNING: sampled documents are not fetchable yet. Wait before replaying.")
+        say("loaded documents are fetchable, and no changes were captured during the load")
     return 0
 
 
@@ -342,7 +347,12 @@ def cmd_parity(ctx: Context, args: argparse.Namespace) -> int:
     settings = ctx.settings
     source, target = ctx.source(), ctx.target()
     parity = reconcile.query_parity(
-        source, target, settings, queries=args.queries, top_k=args.top_k
+        source,
+        target,
+        settings,
+        queries=args.queries,
+        top_k=args.top_k,
+        min_recall=args.min_recall,
     )
     say(parity.render())
     if args.bm25:
@@ -534,6 +544,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("parity", help="compare dense query results across both indexes")
     p.add_argument("--queries", type=int, default=20)
     p.add_argument("--top-k", type=int, default=10)
+    p.add_argument(
+        "--min-recall",
+        type=float,
+        default=reconcile.DEFAULT_MIN_RECALL,
+        help="recall below this is investigated rather than assumed fatal",
+    )
     p.add_argument("--bm25", help="also run this keyword query against the target")
     p.set_defaults(func=cmd_parity)
 
