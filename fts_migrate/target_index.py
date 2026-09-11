@@ -35,9 +35,9 @@ def build_schema(settings: Settings, source: SourceSpec) -> dict[str, Any]:
         dimension=source.dimension,
         metric=source.metric,
     )
-    fts_options = dict(settings.target.full_text_search or {})
     for name in settings.target.text_fields:
-        builder = builder.add_string_field(name, full_text_search=fts_options or True)
+        options = settings.target.options_for(name)
+        builder = builder.add_string_field(name, full_text_search=options or True)
     return builder.build()
 
 

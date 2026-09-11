@@ -8,6 +8,7 @@ __all__ = [
     "dense_source",
     "importer",
     "reconcile",
+    "retry",
     "simulate",
     "target_index",
 ]

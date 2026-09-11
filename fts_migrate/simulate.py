@@ -1,7 +1,7 @@
 """Stand in for the two things a real migration brings with it.
 
-A dense index that is being read and written the whole time, and a Parquet export of
-it. Both are simulated here so the rest of the toolkit can be exercised end to end
+A dense index that is being read from and written to the whole time, and a Parquet
+export of it. Both are simulated here so the rest of the toolkit can be exercised end to end
 before it is pointed at production. A real migration skips `seed_index` and `Workload`
 entirely and replaces `export_namespace` with the Parquet files Pinecone Support
 delivers from a backup export.
@@ -24,6 +24,7 @@ from pinecone import Pinecone, ServerlessSpec
 
 from .config import Settings
 from .dense_source import iter_records
+from .retry import with_retry
 
 TOPICS = {
     "databases": "vector database index namespace shard replica query latency recall",
@@ -34,6 +35,12 @@ TOPICS = {
 }
 CATEGORIES = list(TOPICS)
 MAX_WORKLOAD_ERRORS = 5
+SEED_BATCH_SIZE = 100
+"""Records per seeding request.
+
+Well under the 1,000-record / 2 MB upsert ceiling: at a few hundred dimensions a
+larger batch is a megabyte-plus request body, which is slow to upload and the first
+thing to time out on a poor connection."""
 
 
 @dataclass
@@ -114,12 +121,14 @@ def seed_index(index: Any, settings: Settings, count: int, seed: int = 7) -> int
     batch: list[dict[str, Any]] = []
     for i in range(count):
         batch.append(make_record(f"doc-{i:07d}", settings.demo.dimension, rng, vector_rng))
-        if len(batch) >= 200:
-            index.upsert(vectors=batch, namespace=settings.source.namespace)
+        if len(batch) >= SEED_BATCH_SIZE:
+            with_retry(
+                lambda b=batch: index.upsert(vectors=b, namespace=settings.source.namespace)
+            )
             written += len(batch)
             batch = []
     if batch:
-        index.upsert(vectors=batch, namespace=settings.source.namespace)
+        with_retry(lambda b=batch: index.upsert(vectors=b, namespace=settings.source.namespace))
         written += len(batch)
     return written
 

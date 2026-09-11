@@ -24,6 +24,7 @@ MAX_TEXT_FIELD_BYTES = 100 * 1024
 MAX_TEXT_FIELD_TOKENS = 10_000
 MAX_METADATA_BYTES = 40 * 1024
 MAX_FIELD_NAME_BYTES = 64
+MAX_RECORD_ID_CHARS = 512
 MAX_ERRORS_KEPT = 20
 
 
@@ -34,10 +35,10 @@ class ConversionError(RuntimeError):
 class MissingTextError(ConversionError):
     """The record has no text for a declared full-text-search field.
 
-    This is the "export without source text in metadata" case. There is nothing the
-    toolkit can invent here: BM25 needs the words. Join the text back in from your
-    system of record before converting, or pass --allow-missing-text to skip these
-    rows and load them later.
+    Your text may live elsewhere, in another system of record rather than in the index.
+    If it does, join it back in before converting, keyed by record id. Passing
+    --allow-missing-text skips these rows instead, so you can load the vectors now and
+    the text later.
     """
 
 
@@ -106,13 +107,20 @@ class DocumentMapper:
         """Build a document, or return None when the row is skipped for missing text."""
         if not record_id:
             raise ConversionError("record has an empty id")
+        if len(record_id) > MAX_RECORD_ID_CHARS:
+            raise ConversionError(
+                f"record id is {len(record_id)} characters, over the "
+                f"{MAX_RECORD_ID_CHARS} character limit"
+            )
 
         doc: dict[str, Any] = {"_id": record_id}
 
         if values is None:
             raise ConversionError(
                 f"{record_id}: no dense values. The target schema declares "
-                f"{self.dense_field!r}, and every document must carry it."
+                f"{self.dense_field!r}, and the service rejects a document that omits it "
+                f"(\"missing required field\"), whatever the import guide says about not "
+                f"needing to populate every declared field."
             )
         values = list(values)
         if self.dimension is None:
@@ -138,9 +146,8 @@ class DocumentMapper:
                 return None
             raise MissingTextError(
                 f"{record_id}: no text for full-text field(s) {', '.join(missing)}. "
-                f"The export carries no searchable text for this record — join it in from "
-                f"your system of record before converting, or rerun with --allow-missing-text "
-                f"to skip these rows."
+                f"If your source text lives elsewhere, join it back in before converting, "
+                f"or rerun with --allow-missing-text to skip these rows and load them later."
             )
 
         self._check_sizes(doc, record_id)

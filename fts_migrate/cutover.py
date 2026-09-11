@@ -159,9 +159,8 @@ class SearchRouter:
     def _compare(self, vector: Sequence[float], top_k: int, served: list[str]) -> None:
         """Query the target for comparison only.
 
-        Deliberately not counted as a target read: the read split is what tells an
-        operator how far the cutover has actually gone, and a shadow query served
-        nobody.
+        Not counted as a target read, because the read split is how you tell how far the
+        cutover has actually gone, and a shadow query was never served to anyone.
         """
         shadow = self._target_search(vector, top_k)
         self.stats.shadow_comparisons += 1

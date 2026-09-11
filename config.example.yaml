@@ -19,6 +19,14 @@ target:
   dense_field: embedding
   # Metadata keys promoted to full-text-search string fields, in order. The first
   # one is what `parity` runs its BM25 checks against.
+  #
+  # A list gives every field the shared full_text_search options below. Use a mapping
+  # instead when one field needs its own analyzer — n-grams can't be combined with
+  # stemming or stop words on the same field:
+  #
+  #   text_fields:
+  #     text: { language: en, stemming: true, stop_words: true }
+  #     sku:  { ngram: { min_gram: 3, max_gram: 4, prefix_only: false } }
   text_fields: [text]
   full_text_search:
     language: en
@@ -51,10 +59,14 @@ import:
   uri: s3://your-bucket/fts-migration
   integration_id: ${PINECONE_STORAGE_INTEGRATION_ID}
   error_mode: continue
+  # Documents per upsert request on the `upsert` path. The API accepts up to 1,000
+  # (2 MB), but a request that large is the first thing to time out on a slow link.
+  batch_size: 200
 
 cdc:
   db: work/cdc.sqlite
-  batch_size: 500
+  # Documents per request when replaying captured changes.
+  batch_size: 200
 
 demo:
   records: 2000

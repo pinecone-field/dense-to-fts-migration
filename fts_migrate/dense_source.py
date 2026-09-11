@@ -1,7 +1,7 @@
 """Read-only access to the dense index that is still serving production traffic.
 
 Every function here reads. Nothing in this module writes to, reconfigures, or deletes
-the source index — that is the safety property the whole migration rests on.
+the source index, which is the safety property the rest of the migration depends on.
 """
 
 from __future__ import annotations

@@ -16,11 +16,20 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .convert import iter_jsonl_dir
+from .retry import with_retry
 from .target_index import MAX_DOCS_PER_UPSERT, fetch_documents
 
 IMPORT_POLL_SECONDS = 20
 TERMINAL_STATES = {"Completed", "Failed", "Cancelled"}
 MAX_UPSERT_BYTES = 2 * 1024 * 1024
+
+DEFAULT_BATCH_DOCS = 200
+DEFAULT_BATCH_BYTES = 1024 * 1024
+"""Default load batch, deliberately under the 1,000-document / 2 MB API ceiling.
+
+The ceiling is what the service accepts, not what uploads reliably. A 2 MB request body
+is the first thing to time out on a slow or congested link, and a migration is exactly
+when you don't want to restart a load."""
 
 
 class BulkImportError(RuntimeError):
@@ -110,8 +119,8 @@ def wait_for_import(
 ) -> dict[str, Any]:
     """Poll until the import reaches a terminal state.
 
-    An import takes at least ten minutes, so this is a long wait by design rather
-    than a sign anything is stuck.
+    An import takes at least ten minutes, so expect a long wait here. It is not a sign
+    that anything is stuck.
     """
     while True:
         state = describe(index, import_id)
@@ -127,12 +136,18 @@ def wait_for_import(
         time.sleep(poll_seconds)
 
 
-def _batched(docs: Iterator[dict[str, Any]]) -> Iterator[list[dict[str, Any]]]:
+def _batched(
+    docs: Iterator[dict[str, Any]],
+    batch_size: int = DEFAULT_BATCH_DOCS,
+    max_bytes: int = DEFAULT_BATCH_BYTES,
+) -> Iterator[list[dict[str, Any]]]:
+    batch_size = min(batch_size, MAX_DOCS_PER_UPSERT)
+    max_bytes = min(max_bytes, MAX_UPSERT_BYTES)
     batch: list[dict[str, Any]] = []
     batch_bytes = 0
     for doc in docs:
         size = len(json.dumps(doc).encode())
-        if batch and (len(batch) >= MAX_DOCS_PER_UPSERT or batch_bytes + size > MAX_UPSERT_BYTES):
+        if batch and (len(batch) >= batch_size or batch_bytes + size > max_bytes):
             yield batch
             batch, batch_bytes = [], 0
         batch.append(doc)
@@ -141,11 +156,17 @@ def _batched(docs: Iterator[dict[str, Any]]) -> Iterator[list[dict[str, Any]]]:
         yield batch
 
 
-def upsert_from_jsonl(index: Any, namespace: str, jsonl_dir: Path, progress: Any = None) -> int:
+def upsert_from_jsonl(
+    index: Any,
+    namespace: str,
+    jsonl_dir: Path,
+    progress: Any = None,
+    batch_size: int = DEFAULT_BATCH_DOCS,
+) -> int:
     """Load the JSONL through the documents API instead of object storage."""
     total = 0
-    for batch in _batched(iter_jsonl_dir(jsonl_dir)):
-        index.documents.upsert(namespace=namespace, documents=batch)
+    for batch in _batched(iter_jsonl_dir(jsonl_dir), batch_size=batch_size):
+        with_retry(lambda b=batch: index.documents.upsert(namespace=namespace, documents=b))
         total += len(batch)
         if progress is not None:
             progress.update(len(batch))
@@ -161,9 +182,9 @@ def wait_until_searchable(
 ) -> bool:
     """Block until a sample of loaded ids is fetchable.
 
-    Documents are indexed asynchronously after a load reports complete, so replaying
-    the CDC backlog straight away can apply a delete before the document it deletes
-    has landed. Waiting here keeps replay ordered behind the bulk load.
+    Documents are indexed asynchronously after a load reports complete, so replaying the
+    CDC backlog straight away can apply a delete before the document it removes has
+    landed. Waiting here keeps replay ordered behind the load.
     """
     if not ids:
         return True

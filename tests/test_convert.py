@@ -220,3 +220,46 @@ def test_the_shipped_example_config_loads_with_no_env_vars_set(monkeypatch):
     monkeypatch.delenv("PINECONE_STORAGE_INTEGRATION_ID", raising=False)
     settings = load_settings("config.example.yaml")
     assert settings.import_.integration_id == ""
+
+
+def test_over_long_record_ids_are_rejected():
+    mapper = DocumentMapper(make_settings(), dimension=3)
+    with pytest.raises(ConversionError, match="over the 512 character limit"):
+        mapper.from_record("x" * 513, [0.1, 0.2, 0.3], {"text": "hi"})
+
+    assert mapper.from_record("x" * 512, [0.1, 0.2, 0.3], {"text": "hi"})["_id"] == "x" * 512
+
+
+def test_text_fields_may_carry_per_field_analyzer_options():
+    """n-grams can't share a field with stemming, so each field needs its own options."""
+    import tempfile
+
+    import yaml as _yaml
+
+    from fts_migrate.config import load_settings
+    from fts_migrate.dense_source import SourceSpec
+    from fts_migrate.target_index import build_schema
+
+    config = {
+        "source": {"index": "src"},
+        "target": {
+            "index": "dst",
+            "dense_field": "embedding",
+            "text_fields": {
+                "text": {"language": "en", "stemming": True},
+                "sku": {"ngram": {"min_gram": 3, "max_gram": 4, "prefix_only": False}},
+            },
+        },
+    }
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as handle:
+        handle.write(_yaml.safe_dump(config, sort_keys=False))
+        path = handle.name
+
+    settings = load_settings(path)
+    assert settings.target.text_fields == ["text", "sku"]
+    assert settings.target.primary_text_field == "text"
+
+    fields = build_schema(settings, SourceSpec("src", 8, "cosine", "h"))["fields"]
+    assert fields["text"]["full_text_search"] == {"language": "en", "stemming": True}
+    assert fields["sku"]["full_text_search"]["ngram"]["max_gram"] == 4
+    assert "stemming" not in fields["sku"]["full_text_search"]

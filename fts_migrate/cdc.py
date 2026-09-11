@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from .convert import DocumentMapper
+from .retry import with_retry
 
 UPSERT = "upsert"
 UPDATE = "update"
@@ -31,6 +32,8 @@ DELETE = "delete"
 MAX_DOCS_PER_UPSERT = 1000
 MAX_IDS_PER_DELETE = 1000
 MAX_UPSERT_BYTES = 2 * 1024 * 1024
+DEFAULT_BATCH_DOCS = 200
+DEFAULT_BATCH_BYTES = 1024 * 1024
 SQLITE_PARAM_CHUNK = 500
 
 UNCAPTURABLE_METHODS = frozenset(
@@ -385,9 +388,9 @@ def _fold(doc_id: str, changes: Sequence[Change], seq: int) -> Action:
 class CdcWrappedIndex:
     """Wraps the source dense index so every write is also written to the CDC log.
 
-    Point the application at this instead of `pc.Index(...)` before taking the export.
-    The dense index is written first and the log second: a failed log append raises,
-    because a silently dropped change is the one failure this migration cannot survive.
+    Point your application at this instead of `pc.Index(...)` before taking the export.
+    The dense index is written first and the log second, and a failed log append raises:
+    a change that reaches the source but not the log is one the target never hears about.
     """
 
     def __init__(self, index: Any, log: CdcLog, namespace: str = "__default__") -> None:
@@ -434,11 +437,15 @@ class CdcWrappedIndex:
                 "migration, resolve the filter to ids first and update by id, so the same "
                 "change can be replayed against the target index."
             )
+        if kwargs.get("dry_run"):
+            raise CdcError(
+                "dry_run is only honoured on update-by-metadata, which this wrapper "
+                "refuses anyway. On a by-id update it is not a preview: the write lands "
+                "on the source index, so skipping the log would drop the change."
+            )
         result = self._index.update(
             id=id, values=values, set_metadata=set_metadata, namespace=namespace, **kwargs
         )
-        if kwargs.get("dry_run"):
-            return result
         self._log.append_update(namespace, id, values=values, set_metadata=set_metadata)
         return result
 
@@ -467,12 +474,16 @@ class CdcWrappedIndex:
 
 def _batched_documents(
     docs: Sequence[Mapping[str, Any]],
+    batch_size: int = DEFAULT_BATCH_DOCS,
+    max_bytes: int = DEFAULT_BATCH_BYTES,
 ) -> Iterator[list[Mapping[str, Any]]]:
+    batch_size = min(batch_size, MAX_DOCS_PER_UPSERT)
+    max_bytes = min(max_bytes, MAX_UPSERT_BYTES)
     batch: list[Mapping[str, Any]] = []
     batch_bytes = 0
     for doc in docs:
         size = len(json.dumps(doc).encode())
-        if batch and (len(batch) >= MAX_DOCS_PER_UPSERT or batch_bytes + size > MAX_UPSERT_BYTES):
+        if batch and (len(batch) >= batch_size or batch_bytes + size > max_bytes):
             yield batch
             batch, batch_bytes = [], 0
         batch.append(doc)
@@ -489,6 +500,7 @@ def apply_changes(
     cursor_name: str = "target",
     source_namespace: str | None = None,
     dry_run: bool = False,
+    batch_size: int = DEFAULT_BATCH_DOCS,
 ) -> ApplyStats:
     """Replay the log onto the target index, from the cursor to the current head.
 
@@ -528,14 +540,13 @@ def apply_changes(
             to_upsert.append(doc)
 
     if not dry_run:
-        for batch in _batched_documents(to_upsert):
-            index.documents.upsert(namespace=namespace, documents=batch)
-        for batch in _batched_documents(to_patch):
-            index.documents.update(namespace=namespace, documents=batch)
+        for batch in _batched_documents(to_upsert, batch_size=batch_size):
+            with_retry(lambda b=batch: index.documents.upsert(namespace=namespace, documents=b))
+        for batch in _batched_documents(to_patch, batch_size=batch_size):
+            with_retry(lambda b=batch: index.documents.update(namespace=namespace, documents=b))
         for start in range(0, len(to_delete), MAX_IDS_PER_DELETE):
-            index.documents.delete(
-                namespace=namespace, ids=to_delete[start : start + MAX_IDS_PER_DELETE]
-            )
+            chunk = to_delete[start : start + MAX_IDS_PER_DELETE]
+            with_retry(lambda c=chunk: index.documents.delete(namespace=namespace, ids=c))
         log.set_cursor(cursor_name, head)
 
     stats.upserted = len(to_upsert)

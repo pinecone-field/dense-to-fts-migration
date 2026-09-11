@@ -1,8 +1,6 @@
-# Migrating a live dense index to Pinecone full-text search — a step-by-step manual
+# Migrating a live index to Pinecone full-text search — a step-by-step manual
 
-This manual walks you through moving a running workload from an **index of dense vectors**
-to an **index with a document schema** — the index type that does BM25 keyword ranking,
-Lucene query syntax, and text-match filters, alongside vector search.
+This manual walks you through moving a running workload from an **index of dense vectors** to an **index with a document schema**, the index type that does BM25 keyword ranking, Lucene query syntax, and text-match filters alongside vector search.
 
 **The guiding principle is safety.** Your dense index stays the source of truth and keeps
 serving traffic the entire time. Every step against it is **read-only**. You only cut reads
@@ -13,11 +11,11 @@ instantly by routing reads back to the dense index.
 > indexes, with writes landing the whole time, so you can watch the flow end to end before
 > touching anything real. `migration_walkthrough.ipynb` is the same thing, one phase per cell.
 
-### Why this is a migration and not a setting
 
-A document schema is fixed at index creation, and an existing dense index cannot be given
-one. Adding full-text search means **creating a new index and reloading your data** — there
-is no in-place upgrade. That is the whole reason this repo exists.
+
+### Why is this a migration and not a setting?
+
+A document schema is fixed at index creation, and an existing dense index cannot yet be given one. Adding full-text search means **creating a new index and reloading your data**; there is no in-place upgrade today. That is what this repo is for.
 
 ### What you will do
 
@@ -34,17 +32,21 @@ is no in-place upgrade. That is the whole reason this repo exists.
 
 ---
 
+
+
 ## Background: how the two index types differ
 
-| Dense index (vector API) | Document-schema index (documents API) |
-|---|---|
-| A **record**: `id`, `values`, `metadata` | A **document**: `_id` plus named fields |
-| `metadata` is an untyped blob, filterable | Fields you declare in a **schema** are searchable; everything else is auto-indexed as filterable metadata |
+
+| Dense index (vector API)                             | Document-schema index (documents API)                                                                              |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| A **record**: `id`, `values`, `metadata`             | A **document**: `_id` plus named fields                                                                            |
+| `metadata` is an untyped blob, filterable            | Fields you declare in a **schema** are searchable; everything else is auto-indexed as filterable metadata          |
 | Text lives in metadata and is not searchable as text | A `string` field with `full_text_search` is BM25-ranked and supports `$match_phrase` / `$match_all` / `$match_any` |
-| `index.upsert` / `query` / `fetch` / `list` | `index.documents.upsert` / `search` / `fetch` / `list` / `update` / `delete` |
-| Ranking is the index metric | Ranking is chosen per request with `score_by`: `text`, `query_string`, `dense_vector`, `sparse_vector` |
-| Bulk import reads **Parquet** | Bulk import reads **JSONL** |
-| Metadata size limit applies to everything | The 40 KB metadata limit does **not** apply to full-text `string` fields |
+| `index.upsert` / `query` / `fetch` / `list`          | `index.documents.upsert` / `search` / `fetch` / `list` / `update` / `delete`                                       |
+| Ranking is the index metric                          | Ranking is chosen per request with `score_by`: `text`, `query_string`, `dense_vector`, `sparse_vector`             |
+| Bulk import reads **Parquet**                        | Bulk import reads **JSONL**                                                                                        |
+| Metadata size limit applies to everything            | The 40 KB metadata limit does **not** apply to full-text `string` fields                                           |
+
 
 The two endpoint families do not cross over: a document-schema index is not reachable through
 `/vectors/*`, and a dense index is not reachable through `/namespaces/*/documents/*`.
@@ -54,6 +56,8 @@ Reference: [Full-text search](https://docs.pinecone.io/guides/search/full-text-s
 [Data modeling](https://docs.pinecone.io/guides/index-data/data-modeling).
 
 ---
+
+
 
 ## Step 0 — Set up
 
@@ -80,10 +84,11 @@ python migrate.py status
 
 ---
 
+
+
 ## Step 1 — Choose the target schema
 
-**This is the irreversible step.** Fields cannot be added, removed, or retyped after the index
-is created; a schema change means another migration. Decide now.
+**This is the step you cannot undo.** Fields cannot yet be added, removed, or retyped after the index is created, so changing your mind later means another migration. Worth taking your time here.
 
 The default in `config.yaml` declares a dense vector field plus one full-text field:
 
@@ -114,14 +119,42 @@ cannot drift.
 Things to settle before you create the index:
 
 - **Which metadata keys become searchable text.** One `string` field per searchable chunk of
-  text; up to 100 of them. Everything else stays metadata and is auto-indexed for filtering.
+text; up to 100 of them. Everything else stays metadata and is auto-indexed for filtering.
 - **Stemming and stop words**, per field. `stemming: true` matches "running" to "run";
-  `stop_words: true` drops "the", "a", "of" from the index.
-- **Substring search** (`ngram`) if you need it — it cannot be combined with stemming or stop
-  words on the same field.
-- **At most one `dense_vector` and one `sparse_vector` field** per index.
+`stop_words: true` drops "the", "a", "of" from the index.
+- **Whether any field needs substring search.** See [n-grams](#do-i-need-n-grams) below.
+- **At most one** `dense_vector` **and one** `sparse_vector` **field** per index.
 - Field names may not start with `_` or `$`, and are limited to 64 bytes. If your metadata has
-  such a key, map it with `convert.rename_fields` or drop it with `convert.drop_fields`.
+such a key, map it with `convert.rename_fields` or drop it with `convert.drop_fields`.
+
+### Do I need n-grams?
+
+By default full-text search matches whole tokens, so a search for `comp` will not find a
+document containing `computer`. If your users type fragments — part of a product code, a SKU,
+the start of a name — configure that field for character n-grams, which index each token as
+overlapping character sequences so a substring matches:
+
+```yaml
+target:
+  text_fields:
+    text: { language: en, stemming: true, stop_words: true }
+    sku:  { ngram: { min_gram: 3, max_gram: 4, prefix_only: false } }
+```
+
+`min_gram` is the shortest sequence to index (at least 1) and `max_gram` the longest (at most
+10); `prefix_only: true` indexes only sequences anchored to the start of a token, which is what
+you want for autocomplete. With `min_gram: 3, max_gram: 4`, the token `search` is indexed as
+`sea`, `ear`, `arc`, `rch`, `sear`, `earc`, `arch`. Smaller windows match more loosely and grow
+the index; larger ones are more precise but need a longer fragment to match. Queries need no
+special syntax — an ordinary `text` or `query_string` search against the field just works.
+
+The catch is that **n-grams cannot be combined with stemming or stop words on the same field**,
+which is why `text_fields` accepts a mapping as well as a plain list. Give the n-gram field its
+own options, as above, and other fields keep the shared `full_text_search` block. If you use
+the list form, every field gets the same options.
+
+For the full analyzer reference, see
+[Text processing](https://docs.pinecone.io/guides/search/full-text-search/text-processing).
 
 ```bash
 python migrate.py create-target        # prints the schema before creating anything
@@ -131,14 +164,15 @@ You can run this now to see the schema, or leave it until step 5.
 
 ---
 
+
+
 ## Step 2 — Turn on change capture, **before** you export
 
 Your index is still taking writes. Bulk import can only create namespaces that do not yet
 exist, so nothing can be written into the target namespace until the import finishes — which
 means every write that lands in between has to be buffered and replayed afterwards.
 
-**Order matters.** Capture must start before the export snapshot, or writes in the gap are
-lost with no way to detect it.
+**Order matters here.** Capture has to start before you take the export snapshot. Anything written in the gap between the two is lost, and nothing downstream can tell you it happened.
 
 ```bash
 python migrate.py enable-cdc
@@ -160,20 +194,21 @@ never has to read back from an index that has since moved on.
 
 Two constraints worth knowing:
 
-- **A log append failure raises.** A silently dropped change is the one failure this migration
-  cannot survive, so it is loud by design.
+- **A failed log append raises rather than continuing.** A change that reaches your dense index but not the log is a change the target index never hears about, so it is better to stop than to carry on quietly.
 - **Writes it cannot capture are refused, not forwarded.** `delete_all` and filtered
-  deletes/updates cannot be replayed as a set of ids; `upsert_from_dataframe`,
-  `upsert_records` and `delete_namespace` bypass the capture path entirely; and `batch_size`
-  on an upsert splits one call into several requests, so a failure part-way through commits
-  some of them to the source while nothing is logged. All of these raise, because a write
-  that reaches the source and not the log is missing from the target at cutover. Resolve
-  filters to ids and batch in your own code.
+deletes/updates cannot be replayed as a set of ids; `upsert_from_dataframe`,
+`upsert_records` and `delete_namespace` bypass the capture path entirely; and `batch_size`
+on an upsert splits one call into several requests, so a failure part-way through commits
+some of them to the source while nothing is logged. All of these raise, because a write
+that reaches the source and not the log is missing from the target at cutover. Resolve
+filters to ids and batch in your own code.
 
 If you use a queue, Kafka topic, or outbox table already, point it at `CdcLog.append_upserts`
 and `CdcLog.append_deletes` instead of wrapping the index — the rest of the flow is unchanged.
 
 ---
+
+
 
 ## Step 3 — Export the dense index to Parquet
 
@@ -198,6 +233,8 @@ If you already have export files, skip this step and drop them in
 
 ---
 
+
+
 ## Step 4 — Convert Parquet to JSONL
 
 Document-schema imports read [JSON Lines](https://jsonlines.org/), not Parquet — one JSON
@@ -218,34 +255,33 @@ rest are stored and auto-indexed as filterable metadata.
 Conversion enforces the document-API limits up front, so problems surface on your workstation
 rather than as per-row import errors twenty minutes in:
 
-| Limit | Value |
-|---|---|
-| Document size | 2 MB |
-| Documents per upsert request | 1000, and 2 MB per request |
-| Full-text `string` field | 100 KB and 10,000 tokens |
-| Metadata per document | 40 KB total (full-text fields exempt) |
-| Field name | 64 bytes, not starting with `_` or `$` |
-| Dense vector | length must equal the schema `dimension`, and present on every document |
+
+| Limit                        | Value                                                                   |
+| ---------------------------- | ----------------------------------------------------------------------- |
+| Document size                | 2 MB                                                                    |
+| Documents per upsert request | 1000, and 2 MB per request                                              |
+| Full-text `string` field     | 100 KB and 10,000 tokens                                                |
+| Metadata per document        | 40 KB total (full-text fields exempt)                                   |
+| Field name                   | 64 bytes, not starting with `_` or `$`                                  |
+| Record ID                    | 512 characters                                                          |
+| Dense vector                 | length must equal the schema `dimension`, and present on every document |
+
 
 `--lenient` skips bad rows and reports them instead of stopping at the first one.
 
-### No source text in the export?
+### What if my dense index doesn't already have the source text in metadata?
 
-Some exports carry vectors and metadata but not the text — it lives in the system of record,
-not in the index. **Conversion stops with an error naming the field and the row.** That is
-deliberate: an index whose full-text field is empty cannot do BM25, and a silent load would
-leave you with an index that looks fine and ranks nothing.
+Plenty of exports carry vectors and metadata but not the searchable text, which may live elsewhere in another system of record. Conversion stops with an error naming the field and the row, because an empty full-text field cannot do BM25 and a silent load would leave you with an index that appears to have a text field with nothing in it to search.
 
-There is nothing the toolkit can invent here. Before converting, join the text back in from
-wherever it lives — a database, a document store, an object-storage corpus — keyed by record
-id, and write it into the `metadata` column under the key named in `source.text_metadata_key`.
-The `demo` and the tests both cover the happy path where the text is already in metadata.
+If your text lives elsewhere, simply join it back in before converting: key it by record id and write it into the `metadata` column under the name you set in `source.text_metadata_key`. Your source of truth might be a database, a document store, or a corpus in object storage. The demo and the tests both cover the simpler case where the text is already in metadata.
 
 If you want to load the vectors now and the text later, `--allow-missing-text` skips those
 rows and reports how many were skipped. They will be **absent** from the target index until
 you join the text in and reload them, so treat that count as a to-do, not a pass.
 
 ---
+
+
 
 ## Step 5 — Create the target index
 
@@ -259,6 +295,8 @@ results rather than an error), and checks that the target namespace does **not**
 is what bulk import requires.
 
 ---
+
+
 
 ## Step 6 — Load the documents
 
@@ -293,14 +331,13 @@ python migrate.py import --mode upsert
 Streams the same JSONL through `documents.upsert` in batches inside the 1000-document / 2 MB
 limits.
 
-Either way, the load ends with a **freshness probe**: documents are indexed asynchronously
-after a load reports complete, so the toolkit fetches a sample of loaded ids until they
-resolve. Do not replay the backlog before that passes — a delete applied ahead of the document
-it deletes is a delete that does nothing.
+Either way, the load ends with a **freshness probe**. Documents are indexed asynchronously after a load reports complete, so the toolkit fetches a sample of loaded ids until they resolve. Wait for that before replaying the backlog: a delete replayed ahead of the document it removes will not find anything to delete.
 
 ---
 
-## Step 7 — Replay the backlog, then stay caught up
+
+
+## Step 7 — Keeping the indexes in sync
 
 ```bash
 python sync.py replay        # drain everything captured since capture started
@@ -325,6 +362,12 @@ are refused by the wrapper for the same reason filtered deletes are.
 `tail` reports lag as both a pending-change count and how far behind the oldest unapplied
 change is. Leave it running through reconciliation and the whole read ramp.
 
+Loads and replays retry transient failures — timeouts, rate limits, 5xx — with exponential
+backoff, because a run measured in hours should not end on one bad request. A 4xx is raised
+immediately, since it will be just as wrong on the next attempt. If a write does slip through
+the gap between landing on the source and reaching the log (or the reverse), the two-way id
+diff in step 8 is what catches it.
+
 **A change replay cannot apply is parked, not dropped.** The only such case is a captured
 record with no text for a full-text field. The cursor still has to move past it, so it is
 written to an `unapplied` table instead of being counted and forgotten — `migrate.py status`
@@ -332,6 +375,8 @@ lists them, and `reconcile` refuses to look clean while any are outstanding. Tho
 are stale on the target until you join the text in and reload them.
 
 ---
+
+
 
 ## Step 8 — Prove the two indexes agree
 
@@ -343,13 +388,13 @@ python migrate.py parity --bm25 "your keyword query"
 Four checks, weakest to strongest:
 
 1. **Counts** — `describe_index_stats` on the source against `describe_namespace().record_count`
-   on the target. Cheap, and can agree while the wrong documents are present.
+  on the target. Cheap, and can agree while the wrong documents are present.
 2. **Id diff, both directions** — every source id missing from the target, *and* every target
-   document the source no longer has. Orphans matter as much as gaps: an orphan is what a
+  document the source no longer has. Orphans matter as much as gaps: an orphan is what a
    dropped delete looks like. `--sample N` for a fast pass; the full sweep for sign-off.
 3. **Field comparison** — vector (`allclose`), full-text field, and metadata, on a sample.
 4. **Query parity** — the same dense queries against both indexes, reported as recall@k and
-   Jaccard@k. The vectors and metric are identical, so anything below ~1.0 means documents are
+  Jaccard@k. The vectors and metric are identical, so anything below ~1.0 means documents are
    missing, not ranked differently.
 
 `reconcile` prints the CDC lag first: if changes are unapplied, the differences below it are
@@ -362,7 +407,9 @@ Sign-off is: **id diff empty, field mismatches zero, recall ≈ 1.0, CDC lag nea
 
 ---
 
-## Step 9 — Cut over, with a way back
+
+
+## Step 9 — Cut over, reversibly
 
 Reads move in stages. Writes keep going to both indexes the entire time, which is what makes
 rollback a percentage change rather than a redeploy.
@@ -390,7 +437,7 @@ In `shadow` mode the dense index answers every request and the document index is
 alongside for comparison only, so a mismatch shows up in the diff counter without ever
 reaching a user.
 
-**Rollback is `python migrate.py cutover --pct 0`.** Nothing else — dual-write is still on, so
+**Rollback is** `python migrate.py cutover --pct 0`**.** Nothing else — dual-write is still on, so
 the dense index has never fallen behind. Setting a percentage moves the state back into `ramp`
 if it had reached `done`, so the same command rolls back from anywhere; a long-running reader
 picks the change up with `CutoverState.reload(path)`, which is what makes it take effect
@@ -407,7 +454,9 @@ Only after the new index has served 100% of reads long enough to trust:
 
 ---
 
-## The timeline, in one picture
+
+
+## Timeline
 
 ```
    capture ON                                                     rollback window
@@ -422,9 +471,11 @@ Only after the new index has served 100% of reads long enough to trust:
  writes go to the dense index AND the CDC log ─────────────────────────────────►│ then FTS only
 ```
 
-The gap between **export** and **replay** is exactly what the CDC log exists to cover.
+The gap between **export** and **replay** is the window the CDC log covers for you.
 
 ---
+
+
 
 ## Try it end to end first
 
@@ -447,29 +498,60 @@ pytest
 
 ---
 
+
+
+## Where the docs and the service disagree
+
+Two contracts this repo depends on read differently in the guides than they behave in
+practice. Both were checked against a live index rather than reasoned about, and the code
+follows the service:
+
+- **The dense** `score_by` **clause names its field as** `field`**, not** `fields`**.** The
+[search guide](https://docs.pinecone.io/guides/search/full-text-search) writes
+`"fields": ["embedding"]`, but Python SDK v10 models only the singular `field` and raises
+`PineconeValueError: Object missing required field 'field'` before the request goes out.
+The plural form may be the REST shape; from Python, use the singular.
+- **A document must carry the dense field, even though the import guide says otherwise.**
+[Prepare document-schema files](https://docs.pinecone.io/guides/index-data/import-data#prepare-document-schema-files-jsonl)
+says a document "doesn't need to populate every declared field", but upserting one without
+the declared `dense_vector` field returns
+`400 INVALID_ARGUMENT ... is missing required field 'embedding'`. `convert` enforces it,
+which is what you want in a migration anyway: a document that arrives without its vector
+has quietly lost semantic parity.
+
+
+
 ## What has been verified
 
-| Path | Status |
-|---|---|
-| Everything except bulk import, end to end against live Pinecone | Verified. `migrate.py demo` on a real project: 2,050 records both sides, 88 writes captured and replayed during the load, id diff empty, field diff empty, dense recall 1.000, BM25 returning ranked hits. |
-| `--mode import` (bulk import from object storage) | **Not yet run against the service.** The JSONL, directory layout, `start_import` call and polling follow the documented contract, but nobody has watched a real import of these files finish. Run it once against your own bucket before relying on it, and please file an issue if the service disagrees with what this repo produces. |
-| Unit tests (`pytest`) | 44 tests, no API key needed: conversion and its limits, the missing-text paths, stale-shard clearing, CDC folding and idempotency, cross-thread capture, the wrapper's refusals, parked changes, reconcile diffing, and router routing including rollback from `done`. |
+
+| Path                                                            | Status                                                                                                                                                                                                                                                                                                                                  |
+| --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Everything except bulk import, end to end against live Pinecone | Verified. `migrate.py demo` on a real project: 2,395 records both sides, 768 writes captured and replayed during the load, id diff empty, field diff empty, dense recall 1.000, BM25 returning ranked hits.                                                                                                                              |
+| `--mode import` (bulk import from object storage)               | **Not yet run against the service.** The JSONL, directory layout, `start_import` call and polling follow the documented contract, but nobody has watched a real import of these files finish. Run it once against your own bucket before relying on it, and please file an issue if the service disagrees with what this repo produces. |
+| Unit tests (`pytest`)                                           | 50 tests, no API key needed: conversion and its limits, the missing-text paths, stale-shard clearing, CDC folding and idempotency, cross-thread capture, the wrapper's refusals, parked changes, reconcile diffing, router routing including rollback from `done`, retry classification, batching, and per-field analyzer options.                                            |
+
 
 ---
+
+
 
 ## Troubleshooting
 
-| Symptom | Cause and fix |
-|---|---|
-| `The namespace "x" already exists. Imports are only allowed into nonexistent namespaces.` | Bulk import only creates namespaces. Delete it, or import into a new one. To import into `__default__`, it must be empty. |
-| Conversion stops with `no text for full-text field` | The export has no searchable text. Join it in from your system of record — see "No source text?" above. |
-| `records_imported` is lower than the rows converted | With `error_mode: continue`, invalid documents are skipped. Describe the import to see the file, row and `_id` of each error. |
-| Search returns nothing right after a load | Documents index asynchronously. Wait for the freshness probe, and check `status.ready` (plus read-capacity state, on dedicated). |
-| Reconcile reports missing ids on a live index | Check the CDC lag first. Replay, wait for freshness, then re-check. |
-| `delete_all`/filtered delete raises from the wrapper | Neither can be replayed as ids. Resolve to ids first, then delete by id. |
-| Import fails on an S3 bucket | The bucket must be on the same cloud as the index; S3 Express One Zone is not supported. |
+
+| Symptom                                                                                   | Cause and fix                                                                                                                    |
+| ----------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `The namespace "x" already exists. Imports are only allowed into nonexistent namespaces.` | Bulk import only creates namespaces. Delete it, or import into a new one. To import into `__default__`, it must be empty.        |
+| Conversion stops with `no text for full-text field`                                       | The export has no searchable text. Join it in from your system of record — see "No source text?" above.                          |
+| `records_imported` is lower than the rows converted                                       | With `error_mode: continue`, invalid documents are skipped. Describe the import to see the file, row and `_id` of each error.    |
+| Search returns nothing right after a load                                                 | Documents index asynchronously. Wait for the freshness probe, and check `status.ready` (plus read-capacity state, on dedicated). |
+| Reconcile reports missing ids on a live index                                             | Check the CDC lag first. Replay, wait for freshness, then re-check.                                                              |
+| `delete_all`/filtered delete raises from the wrapper                                      | Neither can be replayed as ids. Resolve to ids first, then delete by id.                                                         |
+| Import fails on an S3 bucket                                                              | The bucket must be on the same cloud as the index; S3 Express One Zone is not supported.                                         |
+
 
 ---
+
+
 
 ## See also
 
@@ -479,3 +561,4 @@ pytest
 - [Data modeling — schema patterns](https://docs.pinecone.io/guides/index-data/data-modeling)
 - [Manage storage integrations](https://docs.pinecone.io/guides/operations/integrations/manage-storage-integrations)
 - [Understanding cost](https://docs.pinecone.io/guides/manage-cost/understanding-cost)
+

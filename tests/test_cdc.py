@@ -150,12 +150,24 @@ def test_only_the_configured_source_namespace_is_replayed(log: CdcLog):
     assert set(target.documents.docs) == {"a"}
 
 
-def test_upserts_are_split_into_api_sized_batches(log: CdcLog):
+def test_upserts_are_split_into_batches(log: CdcLog):
+    target = FakeTargetIndex()
+    mapper = DocumentMapper(make_settings(), dimension=3)
+    log.append_upserts("__default__", [record(f"doc-{i}") for i in range(500)])
+
+    apply_changes(target, log, mapper, namespace="__default__", batch_size=200)
+
+    assert target.documents.upsert_calls == [200, 200, 100]
+    assert len(target.documents.docs) == 500
+
+
+def test_a_batch_size_over_the_api_ceiling_is_clamped(log: CdcLog):
+    """The service caps an upsert at 1,000 documents, whatever the config asks for."""
     target = FakeTargetIndex()
     mapper = DocumentMapper(make_settings(), dimension=3)
     log.append_upserts("__default__", [record(f"doc-{i}") for i in range(2500)])
 
-    apply_changes(target, log, mapper, namespace="__default__")
+    apply_changes(target, log, mapper, namespace="__default__", batch_size=5000)
 
     assert target.documents.upsert_calls == [1000, 1000, 500]
     assert len(target.documents.docs) == 2500
@@ -301,10 +313,15 @@ def test_batch_size_is_refused_because_a_partial_failure_would_not_be_logged(log
         wrapped.upsert(vectors=[record("a")], batch_size=200)
 
 
-def test_dry_run_updates_are_not_logged(log: CdcLog):
-    wrapped = CdcWrappedIndex(FakeVectorIndex(), log)
-    wrapped.update(id="a", set_metadata={"text": "x"}, dry_run=True)
+def test_dry_run_on_a_by_id_update_is_refused(log: CdcLog):
+    """dry_run previews only update-by-metadata. On a by-id update the write lands, so
+    treating it as a no-op would drop the change from the log."""
+    index = FakeVectorIndex()
+    wrapped = CdcWrappedIndex(index, log)
+    with pytest.raises(CdcError, match="dry_run"):
+        wrapped.update(id="a", set_metadata={"text": "x"}, dry_run=True)
     assert log.head_seq() == 0
+    assert index.records == {}
 
 
 def test_unappliable_changes_are_parked_rather_than_forgotten(log: CdcLog):
@@ -324,3 +341,41 @@ def test_unappliable_changes_are_parked_rather_than_forgotten(log: CdcLog):
     ]
     assert log.unapplied_count() == 1
     assert "PARKED" in stats.summary()
+
+
+def test_transient_failures_are_retried_but_client_errors_are_not():
+    from pinecone.errors import NotFoundError, PineconeTimeoutError
+
+    from fts_migrate.retry import with_retry
+
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise PineconeTimeoutError("The write operation timed out")
+        return "ok"
+
+    assert with_retry(flaky, backoff=0) == "ok"
+    assert calls["n"] == 3
+
+    def broken():
+        calls["n"] += 1
+        raise NotFoundError("index does not exist")
+
+    calls["n"] = 0
+    with pytest.raises(NotFoundError):
+        with_retry(broken, backoff=0)
+    assert calls["n"] == 1
+
+
+def test_retry_gives_up_and_reraises():
+    from pinecone.errors import PineconeTimeoutError
+
+    from fts_migrate.retry import with_retry
+
+    def always_times_out():
+        raise PineconeTimeoutError("nope")
+
+    with pytest.raises(PineconeTimeoutError):
+        with_retry(always_times_out, attempts=2, backoff=0)

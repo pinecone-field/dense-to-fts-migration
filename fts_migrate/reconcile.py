@@ -181,6 +181,10 @@ def query_parity(
 
     The vectors are identical and the metric is copied from the source, so anything
     below ~1.0 recall means documents are missing rather than ranked differently.
+
+    The dense clause names its field as `field`, singular. The search guide writes it
+    as `fields: [...]`, but SDK v10 models only `field` and rejects the plural form
+    before the request is sent, so the singular is what works from Python.
     """
     rng = random.Random(seed)
     candidate_ids = list(dense_source.iter_ids(source, settings.source.namespace, limit=1000))

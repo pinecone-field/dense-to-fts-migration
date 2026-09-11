@@ -186,7 +186,9 @@ def cmd_import(ctx: Context, args: argparse.Namespace) -> int:
     mode = args.mode or settings.import_.mode
 
     if mode == "upsert":
-        loaded = importer.upsert_from_jsonl(target, settings.target.namespace, jsonl_dir)
+        loaded = importer.upsert_from_jsonl(
+            target, settings.target.namespace, jsonl_dir, batch_size=settings.import_.batch_size
+        )
         say(f"upserted {loaded} documents into {settings.target.index}/{settings.target.namespace}")
     else:
         settings.require_env(
@@ -247,6 +249,7 @@ def cmd_replay(ctx: Context, args: argparse.Namespace) -> int:
             cursor_name=CURSOR_NAME,
             source_namespace=settings.source.namespace,
             dry_run=args.dry_run,
+            batch_size=settings.cdc.batch_size,
         )
         say(("dry run: " if args.dry_run else "") + stats.summary())
         say(f"lag now: {log.lag(CURSOR_NAME)}")
@@ -268,6 +271,7 @@ def cmd_tail(ctx: Context, args: argparse.Namespace) -> int:
                     namespace=settings.target.namespace,
                     cursor_name=CURSOR_NAME,
                     source_namespace=settings.source.namespace,
+                    batch_size=settings.cdc.batch_size,
                 )
                 lag = log.lag(CURSOR_NAME)
                 if stats.upserted or stats.deleted:

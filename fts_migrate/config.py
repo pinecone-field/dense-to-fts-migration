@@ -58,12 +58,22 @@ class TargetSettings:
     text_fields: list[str]
     namespace: str = "__default__"
     full_text_search: dict[str, Any] = field(default_factory=dict)
+    field_options: dict[str, dict[str, Any]] = field(default_factory=dict)
     deployment: dict[str, Any] = field(default_factory=dict)
     read_capacity: dict[str, Any] = field(default_factory=dict)
 
     @property
     def primary_text_field(self) -> str:
         return self.text_fields[0]
+
+    def options_for(self, name: str) -> dict[str, Any]:
+        """Analyzer options for one text field, falling back to the shared block.
+
+        Per-field options matter because some settings are mutually exclusive on a
+        single field: `ngram` can't be combined with stemming or stop words, so a
+        substring-searchable field needs its own config rather than the shared one.
+        """
+        return dict(self.field_options.get(name) or self.full_text_search or {})
 
 
 @dataclass(frozen=True)
@@ -86,6 +96,7 @@ class ImportSettings:
     uri: str = ""
     integration_id: str = ""
     error_mode: str = "continue"
+    batch_size: int = 200
 
 
 @dataclass(frozen=True)
@@ -144,7 +155,12 @@ def load_settings(path: str | Path | None = None) -> Settings:
 
     try:
         source = SourceSettings(**raw["source"])
-        target = TargetSettings(**raw["target"])
+        target_raw = dict(raw["target"])
+        declared = target_raw.get("text_fields")
+        if isinstance(declared, dict):
+            target_raw["text_fields"] = list(declared)
+            target_raw["field_options"] = {k: dict(v or {}) for k, v in declared.items()}
+        target = TargetSettings(**target_raw)
     except KeyError as exc:
         raise ConfigError(f"{config_path} is missing the {exc} section.") from exc
     except TypeError as exc:
