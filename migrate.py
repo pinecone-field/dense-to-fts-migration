@@ -23,6 +23,7 @@ from fts_migrate.convert import DocumentMapper, iter_jsonl_dir, parquet_to_jsonl
 
 CURSOR_NAME = "target"
 CUTOVER_STATE_PATH = Path("work/cutover.json")
+HEARTBEAT_SECONDS = 60
 
 
 @dataclass
@@ -214,20 +215,32 @@ def cmd_import(ctx: Context, args: argparse.Namespace) -> int:
         if not args.wait:
             say(f"track it with: python migrate.py import-status {import_id}")
             return 0
-        seen: set[tuple[Any, Any]] = set()
+        seen: set[tuple[Any, Any, Any]] = set()
+        started = last_line = time.time()
 
         def report(state: dict[str, Any]) -> None:
-            """Print only when the import's status or progress actually moves.
+            """Print when the import moves, and at least once a minute regardless.
 
             An import runs for ten minutes or more at a 20-second poll, so echoing
-            every poll buries the one line that changes."""
-            key = (state.get("status"), state.get("percent_complete"))
-            if key not in seen:
-                seen.add(key)
-                say(
-                    f"  {state.get('status')} {state.get('percent_complete')}% "
-                    f"({state.get('records_imported')} records)"
-                )
+            every poll buries the line that changed. Going silent is worse, though:
+            over a wait that long, no output at all is indistinguishable from a hang,
+            and progress can sit on one percentage while records climb.
+            """
+            nonlocal last_line
+            key = (
+                state.get("status"),
+                state.get("percent_complete"),
+                state.get("records_imported"),
+            )
+            if key in seen and time.time() - last_line < HEARTBEAT_SECONDS:
+                return
+            seen.add(key)
+            last_line = time.time()
+            say(
+                f"  {state.get('status')} {state.get('percent_complete')}% "
+                f"({state.get('records_imported')} records, "
+                f"{int(time.time() - started)}s elapsed)"
+            )
 
         state = importer.wait_for_import(target, import_id, on_poll=report)
         say(f"import {import_id} completed: {state.get('records_imported')} records")

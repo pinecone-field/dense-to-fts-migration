@@ -311,13 +311,20 @@ python migrate.py import --mode import
 It uploads `work/jsonl/<namespace>/` to `<uri>/<namespace>/`, calls `start_import` against the
 whole dataset prefix, and polls until the import finishes. You need a
 [storage integration](https://docs.pinecone.io/guides/operations/integrations/manage-storage-integrations)
-unless the bucket is public. Set `import.uri` and `import.integration_id` in `config.yaml`. If you
-don't know your integration's id, list them with:
+unless the bucket is public. Set `import.uri` and `import.integration_id` in `config.yaml`.
+
+The id is on the [Storage integrations](https://app.pinecone.io/organizations/-/projects/-/storage)
+page of the console. There is also an API, which is quicker when you already have a key to hand:
 
 ```bash
 curl -sS https://api.pinecone.io/storage-integrations \
   -H "Api-Key: $PINECONE_API_KEY" -H "X-Pinecone-Api-Version: unstable"
 ```
+
+That returns each integration's `id`, `provider` and `status` — check the status is `Validated`
+before importing, since an integration whose role Pinecone cannot assume is still created, just
+`Invalid`. Note this is an **unstable** endpoint: only the `POST` form is documented, and
+unstable routes can change without notice, so the console remains the stable answer.
 Automatic upload is implemented for S3; for GCS or Azure, copy the tree up with your provider's
 CLI and pass `--skip-upload`.
 
