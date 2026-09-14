@@ -352,3 +352,21 @@ def test_a_schema_without_a_searchable_field_is_refused(tmp_path: Path):
     schema = {"fields": {"embedding": {"type": "dense_vector", "dimension": 8, "metric": "cosine"}}}
     with pytest.raises(ConfigError, match="no string field with full_text_search"):
         load_settings(_write(tmp_path, _base_config(), schema))
+
+
+def test_a_schema_copied_from_a_legacy_index_is_refused(tmp_path: Path):
+    """describe_index on a legacy dense index reports its vector as `_values`, so copying
+    that schema forward is a natural mistake. The API rejects it at creation; catch it at
+    config load, before an export and a conversion have been spent."""
+    from fts_migrate.config import ConfigError, load_settings
+
+    schema = {
+        "fields": {
+            "_values": {"type": "dense_vector", "dimension": 1024, "metric": "cosine"},
+            "_sparse_values": {"type": "sparse_vector"},
+            "text": {"type": "string", "full_text_search": {"language": "en"}},
+        }
+    }
+    with pytest.raises(ConfigError, match="_sparse_values, _values") as exc:
+        load_settings(_write(tmp_path, _base_config(), schema))
+    assert "embedding" in str(exc.value)

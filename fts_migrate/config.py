@@ -171,6 +171,17 @@ def _load_schema_file(config_path: Path, schema_file: str) -> dict[str, Any]:
             f'{{"fields": {{"embedding": {{"type": "dense_vector", ...}}}}}}'
         )
 
+    reserved = sorted(name for name in fields if name.startswith("_"))
+    if reserved:
+        raise ConfigError(
+            f"{path} declares reserved field name(s) {', '.join(reserved)}. Those are the "
+            f"implicit names a legacy dense index uses internally — describe_index reports "
+            f"'_values' and '_sparse_values' — and a schema may only use them when it declares "
+            f"nothing else, which produces another vectors-API index rather than a document "
+            f"one. Give the field a name of your own, e.g. 'embedding'; conversion maps the "
+            f"export's vectors onto whatever you choose."
+        )
+
     dense = [name for name, spec in fields.items() if spec.get("type") == "dense_vector"]
     if len(dense) != 1:
         raise ConfigError(

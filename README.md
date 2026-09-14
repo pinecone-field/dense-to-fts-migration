@@ -169,6 +169,33 @@ python migrate.py schema > schema.json   # or start a JSON file from your YAML
 `schema.example.json` in this repo shows a dense field, a stemmed text field, and an n-gram
 field side by side.
 
+### Your dense index already has an implicit field name
+
+A dense index created without a schema still has one internally, and `describe_index` will
+show it to you:
+
+```json
+"schema": {"fields": {
+  "_values":        {"type": "dense_vector", "dimension": 1024, "metric": "cosine"},
+  "_sparse_values": {"type": "sparse_vector"}
+}}
+```
+
+`_values` and `_sparse_values` are reserved names that mark an index as served by the vectors
+API. **Renaming is part of the migration, not an option**: a schema may use those names only
+when it declares nothing else, and asking for one alongside a full-text field is refused —
+
+> `Schema field name '_values' starts with '_', which is reserved. To create an index served
+> by the vectors API, the schema must contain only '_values' (type dense_vector) and/or
+> '_sparse_values' (type sparse_vector) and no other fields; otherwise name the field without
+> a leading underscore.`
+
+So pick your own name. `target.dense_field` (or the dense field in your `schema.json`) is that
+name, and conversion maps the export's vectors onto it — the export column is positional, so
+nothing is tied to what the old index called it. Copying a legacy schema into `schema.json`
+unchanged is caught when the config loads, rather than at index creation after you have already
+spent an export and a conversion.
+
 Carrying the vector across is what makes the new index a **superset** of the old one: it can
 still answer every semantic query the dense index answers, and it adds keyword ranking. The
 dimension and metric are read from your source index rather than configured by hand, so they
@@ -605,7 +632,7 @@ has quietly lost semantic parity.
 | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Everything except bulk import, end to end against live Pinecone | Verified. `migrate.py demo` on a real project: 2,395 records both sides, 768 writes captured and replayed during the load, id diff empty, field diff empty, dense recall 1.000, BM25 returning ranked hits.                                                                                                                              |
 | `--mode import` (bulk import from object storage) | Verified against the service. 600 documents uploaded to S3 and imported through a storage integration: the import reported `Completed 100.0%` with 600 records, matching what `convert` produced, and the imported index reconciled exactly against the source (0 missing, 0 orphaned, 0 field mismatches) with dense recall 1.000 and working BM25 ranking. |
-| Unit tests (`pytest`) | 56 tests, no API key needed: conversion and its limits, the missing-text paths, stale-shard clearing, CDC folding and idempotency, cross-thread capture, the wrapper's refusals, parked changes, reconcile diffing, router routing including rollback from `done`, retry classification, batching, per-field analyzer options, parity telling ranking noise apart from missing documents, and the JSON schema path including its dimension and metric guards. |
+| Unit tests (`pytest`) | 57 tests, no API key needed: conversion and its limits, the missing-text paths, stale-shard clearing, CDC folding and idempotency, cross-thread capture, the wrapper's refusals, parked changes, reconcile diffing, router routing including rollback from `done`, retry classification, batching, per-field analyzer options, parity telling ranking noise apart from missing documents, and the JSON schema path including its dimension, metric and reserved-name guards. |
 
 
 ---
