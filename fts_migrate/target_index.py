@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Iterator, Mapping, Sequence
+from copy import deepcopy
 from typing import Any
 
 from pinecone import Pinecone, SchemaBuilder
@@ -29,7 +30,16 @@ class TargetError(RuntimeError):
 
 
 def build_schema(settings: Settings, source: SourceSpec) -> dict[str, Any]:
-    """Declare the dense field plus one string field per configured text field."""
+    """Resolve the schema to send to `indexes.create`.
+
+    A schema declared as JSON is passed through as written, so what you reviewed is what
+    is sent. Its dense field is still checked against the source index: a dimension or
+    metric that disagrees would build an index that cannot answer the queries the old
+    one answers, and that is not recoverable after creation.
+    """
+    if settings.target.schema is not None:
+        return _validated_schema(settings, source)
+
     builder = SchemaBuilder().add_dense_vector_field(
         settings.target.dense_field,
         dimension=source.dimension,
@@ -39,6 +49,32 @@ def build_schema(settings: Settings, source: SourceSpec) -> dict[str, Any]:
         options = settings.target.options_for(name)
         builder = builder.add_string_field(name, full_text_search=options or True)
     return builder.build()
+
+
+def _validated_schema(settings: Settings, source: SourceSpec) -> dict[str, Any]:
+    document = deepcopy(settings.target.schema or {})
+    dense = document["fields"][settings.target.dense_field]
+
+    declared_dimension = dense.get("dimension")
+    if declared_dimension is None:
+        dense["dimension"] = source.dimension
+    elif int(declared_dimension) != source.dimension:
+        raise TargetError(
+            f"{settings.target.dense_field!r} declares dimension {declared_dimension}, but "
+            f"{source.name} has dimension {source.dimension}. The vectors you are migrating "
+            f"would not fit."
+        )
+
+    declared_metric = dense.get("metric")
+    if declared_metric is None:
+        dense["metric"] = source.metric
+    elif str(declared_metric) != source.metric:
+        raise TargetError(
+            f"{settings.target.dense_field!r} declares metric {declared_metric!r}, but "
+            f"{source.name} uses {source.metric!r}. Ranking would not match the index you "
+            f"are replacing."
+        )
+    return document
 
 
 def create_index(pc: Pinecone, settings: Settings, source: SourceSpec) -> Any:

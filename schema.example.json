@@ -1,0 +1,24 @@
+{
+  "fields": {
+    "embedding": {
+      "type": "dense_vector",
+      "dimension": 1536,
+      "metric": "cosine"
+    },
+    "text": {
+      "type": "string",
+      "description": "The searchable body carried over from the dense index's metadata",
+      "full_text_search": {
+        "language": "en",
+        "stemming": true,
+        "stop_words": true
+      }
+    },
+    "sku": {
+      "type": "string",
+      "full_text_search": {
+        "ngram": { "min_gram": 3, "max_gram": 4, "prefix_only": false }
+      }
+    }
+  }
+}

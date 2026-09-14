@@ -263,3 +263,92 @@ def test_text_fields_may_carry_per_field_analyzer_options():
     assert fields["text"]["full_text_search"] == {"language": "en", "stemming": True}
     assert fields["sku"]["full_text_search"]["ngram"]["max_gram"] == 4
     assert "stemming" not in fields["sku"]["full_text_search"]
+
+
+def _write(tmp_path: Path, config: dict, schema: dict | None = None) -> Path:
+    import json as _json
+
+    import yaml as _yaml
+
+    if schema is not None:
+        (tmp_path / "schema.json").write_text(_json.dumps(schema))
+    path = tmp_path / "config.yaml"
+    path.write_text(_yaml.safe_dump(config, sort_keys=False))
+    return path
+
+
+def _base_config() -> dict:
+    return {
+        "source": {"index": "src"},
+        "target": {"index": "dst", "schema_file": "schema.json"},
+    }
+
+
+def test_a_json_schema_is_sent_as_written(tmp_path: Path):
+    """The point of declaring it as JSON is that what you reviewed is what is sent."""
+    from fts_migrate.config import load_settings
+    from fts_migrate.dense_source import SourceSpec
+    from fts_migrate.target_index import build_schema
+
+    schema = {
+        "fields": {
+            "embedding": {"type": "dense_vector", "dimension": 8, "metric": "cosine"},
+            "body": {"type": "string", "full_text_search": {"language": "en"}},
+            "sku": {"type": "string", "full_text_search": {"ngram": {"min_gram": 3}}},
+        }
+    }
+    settings = load_settings(_write(tmp_path, _base_config(), schema))
+
+    assert settings.target.dense_field == "embedding"
+    assert settings.target.text_fields == ["body", "sku"]
+    assert build_schema(settings, SourceSpec("src", 8, "cosine", "h")) == schema
+
+
+def test_dimension_and_metric_are_filled_in_from_the_source(tmp_path: Path):
+    from fts_migrate.config import load_settings
+    from fts_migrate.dense_source import SourceSpec
+    from fts_migrate.target_index import build_schema
+
+    schema = {
+        "fields": {
+            "embedding": {"type": "dense_vector"},
+            "body": {"type": "string", "full_text_search": {}},
+        }
+    }
+    settings = load_settings(_write(tmp_path, _base_config(), schema))
+    built = build_schema(settings, SourceSpec("src", 1536, "dotproduct", "h"))
+
+    assert built["fields"]["embedding"]["dimension"] == 1536
+    assert built["fields"]["embedding"]["metric"] == "dotproduct"
+    assert settings.target.schema["fields"]["embedding"] == {"type": "dense_vector"}
+
+
+def test_a_schema_that_disagrees_with_the_source_is_refused(tmp_path: Path):
+    from fts_migrate.config import load_settings
+    from fts_migrate.dense_source import SourceSpec
+    from fts_migrate.target_index import TargetError, build_schema
+
+    schema = {
+        "fields": {
+            "embedding": {"type": "dense_vector", "dimension": 768, "metric": "cosine"},
+            "body": {"type": "string", "full_text_search": {}},
+        }
+    }
+    settings = load_settings(_write(tmp_path, _base_config(), schema))
+
+    with pytest.raises(TargetError, match="would not fit"):
+        build_schema(settings, SourceSpec("src", 1536, "cosine", "h"))
+
+    schema["fields"]["embedding"]["dimension"] = 1536
+    schema["fields"]["embedding"]["metric"] = "euclidean"
+    settings = load_settings(_write(tmp_path, _base_config(), schema))
+    with pytest.raises(TargetError, match="Ranking would not match"):
+        build_schema(settings, SourceSpec("src", 1536, "cosine", "h"))
+
+
+def test_a_schema_without_a_searchable_field_is_refused(tmp_path: Path):
+    from fts_migrate.config import ConfigError, load_settings
+
+    schema = {"fields": {"embedding": {"type": "dense_vector", "dimension": 8, "metric": "cosine"}}}
+    with pytest.raises(ConfigError, match="no string field with full_text_search"):
+        load_settings(_write(tmp_path, _base_config(), schema))

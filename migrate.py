@@ -167,6 +167,13 @@ def cmd_convert(ctx: Context, args: argparse.Namespace) -> int:
     return 0 if stats.converted else 1
 
 
+def cmd_schema(ctx: Context, args: argparse.Namespace) -> int:
+    """Print the exact schema `create-target` would send, and create nothing."""
+    schema = target_index.build_schema(ctx.settings, ctx.source_spec)
+    print(json.dumps(schema, indent=2))
+    return 0
+
+
 def cmd_create_target(ctx: Context, args: argparse.Namespace) -> int:
     settings = ctx.settings
     source_spec = ctx.source_spec
@@ -513,6 +520,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--allow-missing-text", action="store_true")
     p.add_argument("--lenient", action="store_true", help="skip bad rows instead of stopping")
     p.set_defaults(func=cmd_convert)
+
+    p = sub.add_parser(
+        "schema", help="print the resolved schema JSON without creating anything"
+    )
+    p.set_defaults(func=cmd_schema)
 
     p = sub.add_parser("create-target", help="create the index with the document schema")
     p.set_defaults(func=cmd_create_target)

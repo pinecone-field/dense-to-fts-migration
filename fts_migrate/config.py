@@ -6,6 +6,7 @@ and `sync.py` all agree on which indexes, namespaces and directories are in play
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -56,6 +57,8 @@ class TargetSettings:
     index: str
     dense_field: str
     text_fields: list[str]
+    schema_file: str | None = None
+    schema: dict[str, Any] | None = None
     namespace: str = "__default__"
     full_text_search: dict[str, Any] = field(default_factory=dict)
     field_options: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -143,6 +146,50 @@ class Settings:
         return key
 
 
+def _load_schema_file(config_path: Path, schema_file: str) -> dict[str, Any]:
+    """Read a literal Pinecone schema document and derive the names the toolkit needs.
+
+    Declaring the schema as JSON means the file you review is the object sent to
+    `indexes.create`, with no translation in between. The field names still have to be
+    known here, because conversion, reconciliation and parity all address fields by
+    name — so they are read back out of the schema rather than configured twice.
+    """
+    path = Path(schema_file)
+    if not path.is_absolute():
+        path = config_path.parent / path
+    if not path.exists():
+        raise ConfigError(f"target.schema_file {path} not found")
+    try:
+        document = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"{path} is not valid JSON: {exc}") from exc
+
+    fields = document.get("fields")
+    if not isinstance(fields, dict) or not fields:
+        raise ConfigError(
+            f"{path} must contain a non-empty 'fields' object, the same shape the API takes: "
+            f'{{"fields": {{"embedding": {{"type": "dense_vector", ...}}}}}}'
+        )
+
+    dense = [name for name, spec in fields.items() if spec.get("type") == "dense_vector"]
+    if len(dense) != 1:
+        raise ConfigError(
+            f"{path} declares {len(dense)} dense_vector fields; this toolkit migrates a dense "
+            f"index, so exactly one is required (an index may declare at most one)."
+        )
+    text = [
+        name
+        for name, spec in fields.items()
+        if spec.get("type") == "string" and spec.get("full_text_search") is not None
+    ]
+    if not text:
+        raise ConfigError(
+            f"{path} declares no string field with full_text_search, so the index could not "
+            f"do BM25. Add one."
+        )
+    return {"dense_field": dense[0], "text_fields": text, "schema": document}
+
+
 def load_settings(path: str | Path | None = None) -> Settings:
     """Read a config file into `Settings`, expanding ${ENV_VAR} references."""
     config_path = Path(path or DEFAULT_CONFIG_PATH)
@@ -156,6 +203,8 @@ def load_settings(path: str | Path | None = None) -> Settings:
     try:
         source = SourceSettings(**raw["source"])
         target_raw = dict(raw["target"])
+        if target_raw.get("schema_file"):
+            target_raw.update(_load_schema_file(config_path, target_raw["schema_file"]))
         declared = target_raw.get("text_fields")
         if isinstance(declared, dict):
             target_raw["text_fields"] = list(declared)

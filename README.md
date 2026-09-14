@@ -130,6 +130,45 @@ SchemaBuilder()
   .build()
 ```
 
+### Declaring the schema as JSON
+
+The YAML above is shorthand. If you would rather review the exact object that gets sent —
+for an audit, a review, or just to be sure — write the schema as JSON and point at it:
+
+```yaml
+target:
+  index: my-fts-index
+  schema_file: schema.json
+```
+
+```json
+{
+  "fields": {
+    "embedding": { "type": "dense_vector" },
+    "text": {
+      "type": "string",
+      "full_text_search": { "language": "en", "stemming": true, "stop_words": true }
+    }
+  }
+}
+```
+
+That file is passed to `indexes.create` as written, with nothing translated in between.
+`dense_field` and `text_fields` are read back out of it, so don't also set them in YAML.
+`dimension` and `metric` may be omitted and are filled in from your source index; declare them
+and they are checked against it, because a schema that disagrees builds an index that cannot
+answer the queries the old one answered, and that cannot be fixed after creation.
+
+Either way, this prints the resolved schema and creates nothing:
+
+```bash
+python migrate.py schema            # the exact JSON create-target would send
+python migrate.py schema > schema.json   # or start a JSON file from your YAML
+```
+
+`schema.example.json` in this repo shows a dense field, a stemmed text field, and an n-gram
+field side by side.
+
 Carrying the vector across is what makes the new index a **superset** of the old one: it can
 still answer every semantic query the dense index answers, and it adds keyword ranking. The
 dimension and metric are read from your source index rather than configured by hand, so they
@@ -176,7 +215,7 @@ For the full analyzer reference, see
 [Text processing](https://docs.pinecone.io/guides/search/full-text-search/text-processing).
 
 ```bash
-python migrate.py create-target        # prints the schema before creating anything
+python migrate.py create-target        # prints the schema, then creates the index
 ```
 
 You can run this now to see the schema, or leave it until step 5.
@@ -566,7 +605,7 @@ has quietly lost semantic parity.
 | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Everything except bulk import, end to end against live Pinecone | Verified. `migrate.py demo` on a real project: 2,395 records both sides, 768 writes captured and replayed during the load, id diff empty, field diff empty, dense recall 1.000, BM25 returning ranked hits.                                                                                                                              |
 | `--mode import` (bulk import from object storage) | Verified against the service. 600 documents uploaded to S3 and imported through a storage integration: the import reported `Completed 100.0%` with 600 records, matching what `convert` produced, and the imported index reconciled exactly against the source (0 missing, 0 orphaned, 0 field mismatches) with dense recall 1.000 and working BM25 ranking. |
-| Unit tests (`pytest`) | 52 tests, no API key needed: conversion and its limits, the missing-text paths, stale-shard clearing, CDC folding and idempotency, cross-thread capture, the wrapper's refusals, parked changes, reconcile diffing, router routing including rollback from `done`, retry classification, batching, per-field analyzer options, and parity telling ranking noise apart from missing documents. |
+| Unit tests (`pytest`) | 56 tests, no API key needed: conversion and its limits, the missing-text paths, stale-shard clearing, CDC folding and idempotency, cross-thread capture, the wrapper's refusals, parked changes, reconcile diffing, router routing including rollback from `done`, retry classification, batching, per-field analyzer options, parity telling ranking noise apart from missing documents, and the JSON schema path including its dimension and metric guards. |
 
 
 ---

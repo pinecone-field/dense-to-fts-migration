@@ -20,6 +20,14 @@ target:
   # Metadata keys promoted to full-text-search string fields, in order. The first
   # one is what `parity` runs its BM25 checks against.
   #
+  # Alternatively, declare the schema as JSON and the file you review is the object
+  # sent to indexes.create, with nothing translated in between. dense_field and
+  # text_fields are read back out of it, so don't set them here as well. dimension and
+  # metric may be omitted and are filled in from the source index; if you do declare
+  # them, they are checked against it.
+  #
+  #   schema_file: schema.json
+  #
   # A list gives every field the shared full_text_search options below. Use a mapping
   # instead when one field needs its own analyzer — n-grams can't be combined with
   # stemming or stop words on the same field:
